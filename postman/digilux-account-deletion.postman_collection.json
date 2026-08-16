@@ -1,0 +1,1151 @@
+{
+    "info": {
+        "_postman_id": "d1g1lux-delete-account-2025",
+        "name": "Digilux Honeywell — Account Deletion API",
+        "description": "## Overview\nEnd-to-end test collection for the two-phase account deletion feature.\n\n## Two-Phase Architecture\n| Phase | Trigger | What it does |\n|---|---|---|\n| **Phase 1** | `DELETE /account` (user JWT) | Immediate revocation — sign-out, mark INACTIVE, release devices, delete Cognito user |\n| **Phase 2 (force)** | `POST /admin/archive` (admin JWT) | Archive all user data to S3, verify, then hard-delete from source tables |\n| **Phase 2 (sweep)** | EventBridge `cron(0 2 * * ? *)` | Same pipeline but runs automatically for all INACTIVE + archivePending=true users |\n\n## Quick Start\n1. Set **collection variables**: `api_id`, `stage`, `cognito_client_id`, `test_username`, `test_password`.\n2. Run **Auth → Get Cognito Token** — `user_jwt` and `user_id` are auto-populated.\n3. Set `admin_token` manually (separate admin user or IAM-signed request).\n4. Run Phase 1 happy path, then Phase 2 happy path to trace a full deletion end-to-end.\n\n## CloudWatch Audit Events\nEvery step emits a structured JSON log line queryable via CloudWatch Logs Insights:\n```\nfilter audit_event in [\"DELETION_REQUEST_RECEIVED\",\"PHASE1_COMPLETE\",\"PHASE2_COMPLETE\"]\n| filter userId = \"{{user_id}}\"\n| sort @timestamp asc\n```",
+        "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+    },
+
+    "variable": [
+        {
+            "key": "base_url",
+            "value": "https://{{api_id}}.execute-api.ap-south-1.amazonaws.com/{{stage}}",
+            "type": "default",
+            "description": "API Gateway invoke URL — built from api_id + stage"
+        },
+        {
+            "key": "api_id",
+            "value": "YOUR_API_GATEWAY_ID",
+            "type": "default",
+            "description": "API Gateway REST API ID (e.g. abc123xyz)"
+        },
+        {
+            "key": "stage",
+            "value": "prod",
+            "type": "default",
+            "description": "Deployment stage: prod / dev / staging"
+        },
+        {
+            "key": "cognito_endpoint",
+            "value": "https://cognito-idp.ap-south-1.amazonaws.com",
+            "type": "default",
+            "description": "Cognito regional endpoint"
+        },
+        {
+            "key": "cognito_client_id",
+            "value": "YOUR_COGNITO_APP_CLIENT_ID",
+            "type": "default",
+            "description": "Cognito User Pool App Client ID"
+        },
+        {
+            "key": "test_username",
+            "value": "",
+            "type": "default",
+            "description": "Cognito username (email) of the test user"
+        },
+        {
+            "key": "test_password",
+            "value": "",
+            "type": "default",
+            "description": "Cognito password of the test user"
+        },
+        {
+            "key": "user_jwt",
+            "value": "",
+            "type": "default",
+            "description": "Cognito AccessToken — auto-populated by 'Get Cognito Token'"
+        },
+        {
+            "key": "user_id",
+            "value": "",
+            "type": "default",
+            "description": "sub claim from user_jwt — auto-decoded by collection pre-request script"
+        },
+        {
+            "key": "admin_token",
+            "value": "",
+            "type": "default",
+            "description": "JWT or API key for the admin force-archive endpoint (set manually)"
+        },
+        {
+            "key": "target_user_id",
+            "value": "",
+            "type": "default",
+            "description": "userId to pass to force-archive (admin use). Set after Phase 1 or manually."
+        },
+        {
+            "key": "_temp_token",
+            "value": "",
+            "type": "default",
+            "description": "Internal — used by negative-test pre-request scripts to inject crafted tokens"
+        }
+    ],
+
+    "event": [
+        {
+            "listen": "prerequest",
+            "script": {
+                "type": "text/javascript",
+                "exec": [
+                    "// Collection-level pre-request: auto-decode user_jwt → user_id",
+                    "const jwt = pm.collectionVariables.get('user_jwt');",
+                    "if (jwt && jwt.split('.').length === 3) {",
+                    "    try {",
+                    "        const b64 = jwt.split('.')[1]",
+                    "            .replace(/-/g, '+').replace(/_/g, '/');",
+                    "        const payload = JSON.parse(atob(b64));",
+                    "        if (payload.sub) {",
+                    "            pm.collectionVariables.set('user_id', payload.sub);",
+                    "        }",
+                    "    } catch (e) {",
+                    "        // JWT not yet set or malformed — ignore",
+                    "    }",
+                    "}"
+                ]
+            }
+        }
+    ],
+
+    "item": [
+
+        {
+            "name": "Auth — Obtain Cognito Token",
+            "description": "Authenticate against Cognito and store the AccessToken. Run this before any Phase 1 requests.",
+            "item": [
+                {
+                    "name": "Get Cognito Token (USER_PASSWORD_AUTH)",
+                    "event": [
+                        {
+                            "listen": "test",
+                            "script": {
+                                "type": "text/javascript",
+                                "exec": [
+                                    "pm.test('Status is 200', () => pm.response.to.have.status(200));",
+                                    "",
+                                    "const body = pm.response.json();",
+                                    "const token = body?.AuthenticationResult?.AccessToken;",
+                                    "",
+                                    "pm.test('AccessToken present in response', () => {",
+                                    "    pm.expect(token).to.be.a('string').and.not.empty;",
+                                    "});",
+                                    "",
+                                    "if (token) {",
+                                    "    pm.collectionVariables.set('user_jwt', token);",
+                                    "    try {",
+                                    "        const b64 = token.split('.')[1]",
+                                    "            .replace(/-/g, '+').replace(/_/g, '/');",
+                                    "        const payload = JSON.parse(atob(b64));",
+                                    "        pm.collectionVariables.set('user_id', payload.sub);",
+                                    "        console.log('user_jwt and user_id populated. sub =', payload.sub);",
+                                    "    } catch (e) {",
+                                    "        console.error('Failed to decode JWT sub:', e);",
+                                    "    }",
+                                    "}",
+                                    "",
+                                    "pm.test('Token type is Bearer', () => {",
+                                    "    pm.expect(body?.AuthenticationResult?.TokenType).to.eql('Bearer');",
+                                    "});",
+                                    "",
+                                    "pm.test('IdToken also present', () => {",
+                                    "    pm.expect(body?.AuthenticationResult?.IdToken).to.be.a('string');",
+                                    "});"
+                                ]
+                            }
+                        }
+                    ],
+                    "request": {
+                        "method": "POST",
+                        "header": [
+                            {
+                                "key": "X-Amz-Target",
+                                "value": "AWSCognitoIdentityProviderService.InitiateAuth"
+                            },
+                            {
+                                "key": "Content-Type",
+                                "value": "application/x-amz-json-1.1"
+                            }
+                        ],
+                        "body": {
+                            "mode": "raw",
+                            "raw": "{\n    \"AuthFlow\": \"USER_PASSWORD_AUTH\",\n    \"ClientId\": \"{{cognito_client_id}}\",\n    \"AuthParameters\": {\n        \"USERNAME\": \"{{test_username}}\",\n        \"PASSWORD\": \"{{test_password}}\"\n    }\n}",
+                            "options": { "raw": { "language": "json" } }
+                        },
+                        "url": {
+                            "raw": "{{cognito_endpoint}}/",
+                            "host": ["{{cognito_endpoint}}"],
+                            "path": [""]
+                        },
+                        "description": "Calls Cognito `InitiateAuth` with `USER_PASSWORD_AUTH` flow.\n\n**On success:** stores `user_jwt` (AccessToken) and `user_id` (sub claim) as collection variables automatically.\n\n**Prerequisites:** `cognito_client_id`, `test_username`, `test_password` must be set.\n\n> The User Pool must have `ALLOW_USER_PASSWORD_AUTH` enabled on the App Client."
+                    },
+                    "response": [
+                        {
+                            "name": "200 — Token issued",
+                            "originalRequest": {
+                                "method": "POST",
+                                "header": [
+                                    {"key": "X-Amz-Target", "value": "AWSCognitoIdentityProviderService.InitiateAuth"},
+                                    {"key": "Content-Type", "value": "application/x-amz-json-1.1"}
+                                ],
+                                "body": {
+                                    "mode": "raw",
+                                    "raw": "{\n    \"AuthFlow\": \"USER_PASSWORD_AUTH\",\n    \"ClientId\": \"YOUR_CLIENT_ID\",\n    \"AuthParameters\": {\n        \"USERNAME\": \"user@example.com\",\n        \"PASSWORD\": \"TestPass123!\"\n    }\n}"
+                                },
+                                "url": {"raw": "https://cognito-idp.ap-south-1.amazonaws.com/"}
+                            },
+                            "status": "OK",
+                            "code": 200,
+                            "_postman_previewlanguage": "json",
+                            "header": [{"key": "Content-Type", "value": "application/x-amz-json-1.1"}],
+                            "body": "{\n    \"AuthenticationResult\": {\n        \"AccessToken\": \"eyJraWQiOiJleGFtcGxlIiwidHlwIjoiSldUIn0.eyJzdWIiOiJjb2duaXRvLXN1Yi11dWlkLWFiYy0xMjMiLCJ1c2VybmFtZSI6InVzZXJAZXhhbXBsZS5jb20ifQ.signature\",\n        \"ExpiresIn\": 3600,\n        \"TokenType\": \"Bearer\",\n        \"RefreshToken\": \"eyJjdHkiOiJKV1QiLCJlbmMiOiJBMjU2R0NNIiwiYWxnIjoiUlNBLU9BRVAifQ...\",\n        \"IdToken\": \"eyJraWQiOiJleGFtcGxlIiwidHlwIjoiSldUIn0...\"\n    },\n    \"ChallengeParameters\": {}\n}"
+                        }
+                    ]
+                }
+            ]
+        },
+
+        {
+            "name": "Phase 1 — DELETE /account  (User-Facing)",
+            "description": "User-initiated account deletion. The caller must supply their own Cognito AccessToken as a Bearer token.\n\n**Lambda:** `phase1_account_deletion`\n**Steps executed:**\n1. Decode JWT → extract `sub` as userId\n2. Idempotency check — return 200 early if already INACTIVE\n3. Global Cognito sign-out\n4. Mark user INACTIVE + `archivePending=true` in DynamoDB\n5. Release all devices (set `userId=\"0\"`)\n6. Delete Cognito user record\n7. Write audit log to `digilux_honeywell_deletion_audit`",
+            "item": [
+
+                {
+                    "name": "01 Happy Path — Initiate Deletion",
+                    "event": [
+                        {
+                            "listen": "test",
+                            "script": {
+                                "type": "text/javascript",
+                                "exec": [
+                                    "pm.test('Status is 200', () => pm.response.to.have.status(200));",
+                                    "",
+                                    "pm.test('Content-Type is application/json', () => {",
+                                    "    pm.expect(pm.response.headers.get('Content-Type')).to.include('application/json');",
+                                    "});",
+                                    "",
+                                    "pm.test('CORS header present', () => {",
+                                    "    pm.expect(pm.response.headers.get('Access-Control-Allow-Origin')).to.eql('*');",
+                                    "});",
+                                    "",
+                                    "const body = pm.response.json();",
+                                    "",
+                                    "pm.test('Response has message field', () => {",
+                                    "    pm.expect(body).to.have.property('message');",
+                                    "    pm.expect(body.message).to.be.a('string').and.not.empty;",
+                                    "});",
+                                    "",
+                                    "pm.test('Message mentions 7 business days', () => {",
+                                    "    pm.expect(body.message).to.include('7 business days');",
+                                    "});",
+                                    "",
+                                    "pm.test('Message confirms access revocation', () => {",
+                                    "    pm.expect(body.message.toLowerCase()).to.include('access');",
+                                    "});",
+                                    "",
+                                    "pm.test('status field is processing', () => {",
+                                    "    pm.expect(body.status).to.eql('processing');",
+                                    "});",
+                                    "",
+                                    "// Save userId for Phase 2 use",
+                                    "const userId = pm.collectionVariables.get('user_id');",
+                                    "if (userId) {",
+                                    "    pm.collectionVariables.set('target_user_id', userId);",
+                                    "    console.log('target_user_id set for Phase 2:', userId);",
+                                    "}"
+                                ]
+                            }
+                        }
+                    ],
+                    "request": {
+                        "method": "DELETE",
+                        "header": [
+                            {
+                                "key": "Authorization",
+                                "value": "Bearer {{user_jwt}}",
+                                "description": "Cognito AccessToken for the account being deleted"
+                            }
+                        ],
+                        "url": {
+                            "raw": "{{base_url}}/account",
+                            "host": ["{{base_url}}"],
+                            "path": ["account"]
+                        },
+                        "description": "Initiates account deletion for the authenticated user.\n\nThe Lambda decodes the Bearer token, extracts the `sub` claim as `userId`, and runs the 7-step Phase 1 pipeline. Returns immediately with an acknowledgement — the actual data deletion happens async in Phase 2.\n\n**Expected audit events in CloudWatch:**\n- `DELETION_REQUEST_RECEIVED`\n- `GLOBAL_SIGN_OUT` (status: ok)\n- `USER_MARKED_INACTIVE`\n- `DEVICES_RELEASED`\n- `COGNITO_USER_DELETED`\n- `PHASE1_COMPLETE`"
+                    },
+                    "response": [
+                        {
+                            "name": "200 — Deletion initiated",
+                            "originalRequest": {
+                                "method": "DELETE",
+                                "header": [{"key": "Authorization", "value": "Bearer eyJ..."}],
+                                "url": {"raw": "https://abc123.execute-api.ap-south-1.amazonaws.com/prod/account"}
+                            },
+                            "status": "OK",
+                            "code": 200,
+                            "_postman_previewlanguage": "json",
+                            "header": [
+                                {"key": "Content-Type", "value": "application/json"},
+                                {"key": "Access-Control-Allow-Origin", "value": "*"},
+                                {"key": "Access-Control-Allow-Methods", "value": "DELETE,OPTIONS"}
+                            ],
+                            "body": "{\n    \"message\": \"Your account deletion request has been received. Your access has been revoked immediately. All associated data will be permanently removed within 7 business days.\",\n    \"status\": \"processing\"\n}"
+                        }
+                    ]
+                },
+
+                {
+                    "name": "02 Idempotent — Already Deleted (Expect 200 early return)",
+                    "event": [
+                        {
+                            "listen": "test",
+                            "script": {
+                                "type": "text/javascript",
+                                "exec": [
+                                    "pm.test('Status is 200', () => pm.response.to.have.status(200));",
+                                    "",
+                                    "const body = pm.response.json();",
+                                    "",
+                                    "pm.test('status field is already_processed', () => {",
+                                    "    pm.expect(body.status).to.eql('already_processed');",
+                                    "});",
+                                    "",
+                                    "pm.test('message is still present', () => {",
+                                    "    pm.expect(body.message).to.be.a('string').and.not.empty;",
+                                    "});"
+                                ]
+                            }
+                        }
+                    ],
+                    "request": {
+                        "method": "DELETE",
+                        "header": [
+                            {
+                                "key": "Authorization",
+                                "value": "Bearer {{user_jwt}}",
+                                "description": "Same token as the happy path — userId is already INACTIVE"
+                            }
+                        ],
+                        "url": {
+                            "raw": "{{base_url}}/account",
+                            "host": ["{{base_url}}"],
+                            "path": ["account"]
+                        },
+                        "description": "Send the deletion request a second time after Phase 1 has already completed.\n\nThe Lambda checks `status = INACTIVE` in `user_data` and returns 200 early without re-processing. Safe to call any number of times.\n\n**Note:** Run this *after* request 01 has succeeded."
+                    },
+                    "response": [
+                        {
+                            "name": "200 — Already processed (idempotent)",
+                            "originalRequest": {
+                                "method": "DELETE",
+                                "header": [{"key": "Authorization", "value": "Bearer eyJ..."}],
+                                "url": {"raw": "https://abc123.execute-api.ap-south-1.amazonaws.com/prod/account"}
+                            },
+                            "status": "OK",
+                            "code": 200,
+                            "_postman_previewlanguage": "json",
+                            "header": [
+                                {"key": "Content-Type", "value": "application/json"},
+                                {"key": "Access-Control-Allow-Origin", "value": "*"}
+                            ],
+                            "body": "{\n    \"message\": \"Your account deletion request has been received. Your access has been revoked immediately. All associated data will be permanently removed within 7 business days.\",\n    \"status\": \"already_processed\"\n}"
+                        }
+                    ]
+                },
+
+                {
+                    "name": "03 Unauthorized — No Authorization Header",
+                    "event": [
+                        {
+                            "listen": "test",
+                            "script": {
+                                "type": "text/javascript",
+                                "exec": [
+                                    "pm.test('Status is 401', () => pm.response.to.have.status(401));",
+                                    "",
+                                    "const body = pm.response.json();",
+                                    "",
+                                    "pm.test('Response body is valid JSON', () => {",
+                                    "    pm.expect(body).to.be.an('object');",
+                                    "});",
+                                    "",
+                                    "pm.test('error field present', () => {",
+                                    "    pm.expect(body).to.have.property('error');",
+                                    "});",
+                                    "",
+                                    "pm.test('message field present', () => {",
+                                    "    pm.expect(body).to.have.property('message');",
+                                    "});"
+                                ]
+                            }
+                        }
+                    ],
+                    "request": {
+                        "method": "DELETE",
+                        "header": [],
+                        "url": {
+                            "raw": "{{base_url}}/account",
+                            "host": ["{{base_url}}"],
+                            "path": ["account"]
+                        },
+                        "description": "Request with no `Authorization` header.\n\nExpected behaviour: Lambda returns 401 with `{ message: \"Unauthorized\", error: \"Authorization token missing\" }`."
+                    },
+                    "response": [
+                        {
+                            "name": "401 — No token",
+                            "originalRequest": {
+                                "method": "DELETE",
+                                "header": [],
+                                "url": {"raw": "https://abc123.execute-api.ap-south-1.amazonaws.com/prod/account"}
+                            },
+                            "status": "Unauthorized",
+                            "code": 401,
+                            "_postman_previewlanguage": "json",
+                            "header": [{"key": "Content-Type", "value": "application/json"}],
+                            "body": "{\n    \"message\": \"Unauthorized\",\n    \"error\": \"Authorization token missing\"\n}"
+                        }
+                    ]
+                },
+
+                {
+                    "name": "04 Unauthorized — Malformed JWT (2 segments only)",
+                    "event": [
+                        {
+                            "listen": "prerequest",
+                            "script": {
+                                "type": "text/javascript",
+                                "exec": [
+                                    "// Build a syntactically invalid JWT (2 parts, not 3)",
+                                    "pm.collectionVariables.set('_temp_token', 'header.payload');"
+                                ]
+                            }
+                        },
+                        {
+                            "listen": "test",
+                            "script": {
+                                "type": "text/javascript",
+                                "exec": [
+                                    "pm.test('Status is 401', () => pm.response.to.have.status(401));",
+                                    "",
+                                    "const body = pm.response.json();",
+                                    "",
+                                    "pm.test('error field mentions invalid format', () => {",
+                                    "    pm.expect(body.error.toLowerCase()).to.include('invalid');",
+                                    "});",
+                                    "",
+                                    "// Cleanup temp variable",
+                                    "pm.collectionVariables.set('_temp_token', '');"
+                                ]
+                            }
+                        }
+                    ],
+                    "request": {
+                        "method": "DELETE",
+                        "header": [
+                            {
+                                "key": "Authorization",
+                                "value": "Bearer {{_temp_token}}",
+                                "description": "Crafted 2-segment token — injected by pre-request script"
+                            }
+                        ],
+                        "url": {
+                            "raw": "{{base_url}}/account",
+                            "host": ["{{base_url}}"],
+                            "path": ["account"]
+                        },
+                        "description": "Sends a token with only 2 dot-separated segments instead of the required 3.\n\nThe pre-request script builds the token `header.payload` and stores it in `_temp_token`. Lambda's `_decode_token` raises `ValueError(\"Invalid JWT format\")` → 401."
+                    },
+                    "response": [
+                        {
+                            "name": "401 — Malformed JWT",
+                            "originalRequest": {
+                                "method": "DELETE",
+                                "header": [{"key": "Authorization", "value": "Bearer header.payload"}],
+                                "url": {"raw": "https://abc123.execute-api.ap-south-1.amazonaws.com/prod/account"}
+                            },
+                            "status": "Unauthorized",
+                            "code": 401,
+                            "_postman_previewlanguage": "json",
+                            "header": [{"key": "Content-Type", "value": "application/json"}],
+                            "body": "{\n    \"message\": \"Unauthorized\",\n    \"error\": \"Invalid JWT format\"\n}"
+                        }
+                    ]
+                },
+
+                {
+                    "name": "05 Unauthorized — JWT Missing sub Claim",
+                    "event": [
+                        {
+                            "listen": "prerequest",
+                            "script": {
+                                "type": "text/javascript",
+                                "exec": [
+                                    "// Build a valid-structure JWT whose payload has no 'sub' claim",
+                                    "const header  = btoa(JSON.stringify({\"alg\":\"RS256\",\"typ\":\"JWT\"}))",
+                                    "    .replace(/=/g,'').replace(/\\+/g,'-').replace(/\\//g,'_');",
+                                    "const payload = btoa(JSON.stringify({\"username\":\"testuser\",\"email\":\"test@example.com\"}))",
+                                    "    .replace(/=/g,'').replace(/\\+/g,'-').replace(/\\//g,'_');",
+                                    "pm.collectionVariables.set('_temp_token', `${header}.${payload}.fakesignature`);"
+                                ]
+                            }
+                        },
+                        {
+                            "listen": "test",
+                            "script": {
+                                "type": "text/javascript",
+                                "exec": [
+                                    "pm.test('Status is 401', () => pm.response.to.have.status(401));",
+                                    "",
+                                    "const body = pm.response.json();",
+                                    "",
+                                    "pm.test('error mentions missing sub', () => {",
+                                    "    pm.expect(body.error.toLowerCase()).to.include('sub');",
+                                    "});",
+                                    "",
+                                    "pm.collectionVariables.set('_temp_token', '');"
+                                ]
+                            }
+                        }
+                    ],
+                    "request": {
+                        "method": "DELETE",
+                        "header": [
+                            {
+                                "key": "Authorization",
+                                "value": "Bearer {{_temp_token}}",
+                                "description": "Structurally valid 3-part JWT, but payload contains no sub claim"
+                            }
+                        ],
+                        "url": {
+                            "raw": "{{base_url}}/account",
+                            "host": ["{{base_url}}"],
+                            "path": ["account"]
+                        },
+                        "description": "Sends a properly structured JWT (3 segments, valid base64 payload) that does not contain a `sub` claim.\n\nThe pre-request script crafts `{\"username\":\"testuser\",\"email\":\"test@example.com\"}` as the payload. Lambda's `_decode_token` raises `ValueError(\"Missing 'sub' in token claims\")` → 401."
+                    },
+                    "response": [
+                        {
+                            "name": "401 — JWT missing sub",
+                            "originalRequest": {
+                                "method": "DELETE",
+                                "header": [{"key": "Authorization", "value": "Bearer eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VybmFtZSI6InRlc3R1c2VyIn0.fakesig"}],
+                                "url": {"raw": "https://abc123.execute-api.ap-south-1.amazonaws.com/prod/account"}
+                            },
+                            "status": "Unauthorized",
+                            "code": 401,
+                            "_postman_previewlanguage": "json",
+                            "header": [{"key": "Content-Type", "value": "application/json"}],
+                            "body": "{\n    \"message\": \"Unauthorized\",\n    \"error\": \"Missing 'sub' in token claims\"\n}"
+                        }
+                    ]
+                },
+
+                {
+                    "name": "06 Unauthorized — Bearer with empty token string",
+                    "event": [
+                        {
+                            "listen": "test",
+                            "script": {
+                                "type": "text/javascript",
+                                "exec": [
+                                    "pm.test('Status is 401', () => pm.response.to.have.status(401));",
+                                    "",
+                                    "pm.test('Response is valid JSON', () => {",
+                                    "    pm.expect(pm.response.json()).to.be.an('object');",
+                                    "});"
+                                ]
+                            }
+                        }
+                    ],
+                    "request": {
+                        "method": "DELETE",
+                        "header": [
+                            {
+                                "key": "Authorization",
+                                "value": "Bearer ",
+                                "description": "Bearer keyword present but no token value"
+                            }
+                        ],
+                        "url": {
+                            "raw": "{{base_url}}/account",
+                            "host": ["{{base_url}}"],
+                            "path": ["account"]
+                        },
+                        "description": "Sends `Authorization: Bearer ` (trailing space, no token). After `.strip()`, the extracted token is an empty string — Lambda returns 401."
+                    },
+                    "response": [
+                        {
+                            "name": "401 — Empty Bearer token",
+                            "originalRequest": {
+                                "method": "DELETE",
+                                "header": [{"key": "Authorization", "value": "Bearer "}],
+                                "url": {"raw": "https://abc123.execute-api.ap-south-1.amazonaws.com/prod/account"}
+                            },
+                            "status": "Unauthorized",
+                            "code": 401,
+                            "_postman_previewlanguage": "json",
+                            "header": [{"key": "Content-Type", "value": "application/json"}],
+                            "body": "{\n    \"message\": \"Unauthorized\",\n    \"error\": \"Authorization token missing\"\n}"
+                        }
+                    ]
+                }
+
+            ]
+        },
+
+        {
+            "name": "Phase 2 — POST /admin/archive  (Admin Force-Archive)",
+            "description": "Admin-triggered archive for a specific `userId`. This endpoint must be protected by an admin authorizer on API Gateway.\n\n**Lambda:** `phase2_archive_worker`\n**Steps executed:**\n1. Guard — verify user is INACTIVE + `archivePending=true`\n2. Resolve — collect all 14 DynamoDB table collections + S3 objects\n3. Archive — write 14 JSON files to `s3://digilux-honeywell-archive/archive/{userId}/dynamodb/`\n4. Verify — `head_object` each file; abort if missing or empty (VerificationError)\n5. Hard-delete — cascade tables first, then direct tables, then S3, then mark done\n\n**Audit log updated in `deletion_audit`:**\n`resolveCompletedAt`, `archiveCompletedAt`, `verifyCompletedAt`, `hardDeleteCompletedAt`, `tablesDeleted`, `s3ObjectsDeleted`",
+            "item": [
+
+                {
+                    "name": "01 Happy Path — Force Archive User",
+                    "event": [
+                        {
+                            "listen": "test",
+                            "script": {
+                                "type": "text/javascript",
+                                "exec": [
+                                    "pm.test('Status is 200', () => pm.response.to.have.status(200));",
+                                    "",
+                                    "pm.test('Content-Type is application/json', () => {",
+                                    "    pm.expect(pm.response.headers.get('Content-Type')).to.include('application/json');",
+                                    "});",
+                                    "",
+                                    "pm.test('CORS header present', () => {",
+                                    "    pm.expect(pm.response.headers.get('Access-Control-Allow-Origin')).to.eql('*');",
+                                    "});",
+                                    "",
+                                    "const body = pm.response.json();",
+                                    "",
+                                    "pm.test('message field present', () => {",
+                                    "    pm.expect(body).to.have.property('message');",
+                                    "    pm.expect(body.message).to.be.a('string').and.not.empty;",
+                                    "});",
+                                    "",
+                                    "pm.test('message mentions Archive complete', () => {",
+                                    "    pm.expect(body.message).to.include('Archive complete');",
+                                    "});",
+                                    "",
+                                    "pm.test('message includes the target userId', () => {",
+                                    "    const userId = pm.collectionVariables.get('target_user_id');",
+                                    "    if (userId) {",
+                                    "        pm.expect(body.message).to.include(userId);",
+                                    "    }",
+                                    "});"
+                                ]
+                            }
+                        }
+                    ],
+                    "request": {
+                        "method": "POST",
+                        "header": [
+                            {
+                                "key": "Authorization",
+                                "value": "Bearer {{admin_token}}",
+                                "description": "Admin JWT — this endpoint must be behind an admin authorizer"
+                            },
+                            {
+                                "key": "Content-Type",
+                                "value": "application/json"
+                            }
+                        ],
+                        "body": {
+                            "mode": "raw",
+                            "raw": "{\n    \"userId\": \"{{target_user_id}}\"\n}",
+                            "options": { "raw": { "language": "json" } }
+                        },
+                        "url": {
+                            "raw": "{{base_url}}/admin/archive",
+                            "host": ["{{base_url}}"],
+                            "path": ["admin", "archive"]
+                        },
+                        "description": "Archives and hard-deletes all data for the given `userId`.\n\n**Prerequisite:** The user must already be in `status=INACTIVE` and `archivePending=true` (i.e., Phase 1 must have completed).\n\n**`target_user_id`** is auto-populated from the Phase 1 happy path test script, or set it manually.\n\n**Expected CloudWatch audit events:**\n- `PHASE2_STARTED`\n- `RESOLVE_COMPLETE` (with per-table counts)\n- `ARCHIVE_COMPLETE`\n- `VERIFY_COMPLETE`\n- `HARD_DELETE_COMPLETE`\n- `PHASE2_COMPLETE`"
+                    },
+                    "response": [
+                        {
+                            "name": "200 — Archive complete",
+                            "originalRequest": {
+                                "method": "POST",
+                                "header": [
+                                    {"key": "Authorization", "value": "Bearer admintoken"},
+                                    {"key": "Content-Type", "value": "application/json"}
+                                ],
+                                "body": {"mode": "raw", "raw": "{\n    \"userId\": \"cognito-sub-uuid-abc-123\"\n}"},
+                                "url": {"raw": "https://abc123.execute-api.ap-south-1.amazonaws.com/prod/admin/archive"}
+                            },
+                            "status": "OK",
+                            "code": 200,
+                            "_postman_previewlanguage": "json",
+                            "header": [
+                                {"key": "Content-Type", "value": "application/json"},
+                                {"key": "Access-Control-Allow-Origin", "value": "*"},
+                                {"key": "Access-Control-Allow-Methods", "value": "POST,OPTIONS"}
+                            ],
+                            "body": "{\n    \"message\": \"Archive complete for userId=cognito-sub-uuid-abc-123\"\n}"
+                        }
+                    ]
+                },
+
+                {
+                    "name": "02 Bad Request — Missing userId in body",
+                    "event": [
+                        {
+                            "listen": "test",
+                            "script": {
+                                "type": "text/javascript",
+                                "exec": [
+                                    "pm.test('Status is 400', () => pm.response.to.have.status(400));",
+                                    "",
+                                    "const body = pm.response.json();",
+                                    "",
+                                    "pm.test('error field mentions userId', () => {",
+                                    "    pm.expect(body.error.toLowerCase()).to.include('userid');",
+                                    "});"
+                                ]
+                            }
+                        }
+                    ],
+                    "request": {
+                        "method": "POST",
+                        "header": [
+                            {"key": "Authorization", "value": "Bearer {{admin_token}}"},
+                            {"key": "Content-Type", "value": "application/json"}
+                        ],
+                        "body": {
+                            "mode": "raw",
+                            "raw": "{}",
+                            "options": { "raw": { "language": "json" } }
+                        },
+                        "url": {
+                            "raw": "{{base_url}}/admin/archive",
+                            "host": ["{{base_url}}"],
+                            "path": ["admin", "archive"]
+                        },
+                        "description": "Body is `{}` — `userId` key is absent. Lambda returns 400 with `{ error: \"userId is required\" }`."
+                    },
+                    "response": [
+                        {
+                            "name": "400 — userId missing",
+                            "originalRequest": {
+                                "method": "POST",
+                                "header": [{"key": "Content-Type", "value": "application/json"}],
+                                "body": {"mode": "raw", "raw": "{}"},
+                                "url": {"raw": "https://abc123.execute-api.ap-south-1.amazonaws.com/prod/admin/archive"}
+                            },
+                            "status": "Bad Request",
+                            "code": 400,
+                            "_postman_previewlanguage": "json",
+                            "header": [{"key": "Content-Type", "value": "application/json"}],
+                            "body": "{\n    \"error\": \"userId is required\"\n}"
+                        }
+                    ]
+                },
+
+                {
+                    "name": "03 Bad Request — Whitespace-only userId",
+                    "event": [
+                        {
+                            "listen": "test",
+                            "script": {
+                                "type": "text/javascript",
+                                "exec": [
+                                    "pm.test('Status is 400', () => pm.response.to.have.status(400));",
+                                    "",
+                                    "const body = pm.response.json();",
+                                    "",
+                                    "pm.test('error field present', () => {",
+                                    "    pm.expect(body).to.have.property('error');",
+                                    "});"
+                                ]
+                            }
+                        }
+                    ],
+                    "request": {
+                        "method": "POST",
+                        "header": [
+                            {"key": "Authorization", "value": "Bearer {{admin_token}}"},
+                            {"key": "Content-Type", "value": "application/json"}
+                        ],
+                        "body": {
+                            "mode": "raw",
+                            "raw": "{\n    \"userId\": \"   \"\n}",
+                            "options": { "raw": { "language": "json" } }
+                        },
+                        "url": {
+                            "raw": "{{base_url}}/admin/archive",
+                            "host": ["{{base_url}}"],
+                            "path": ["admin", "archive"]
+                        },
+                        "description": "`userId` value is `\"   \"` (spaces only). After `.strip()` it becomes an empty string — Lambda returns 400."
+                    },
+                    "response": [
+                        {
+                            "name": "400 — Whitespace userId",
+                            "originalRequest": {
+                                "method": "POST",
+                                "header": [{"key": "Content-Type", "value": "application/json"}],
+                                "body": {"mode": "raw", "raw": "{\n    \"userId\": \"   \"\n}"},
+                                "url": {"raw": "https://abc123.execute-api.ap-south-1.amazonaws.com/prod/admin/archive"}
+                            },
+                            "status": "Bad Request",
+                            "code": 400,
+                            "_postman_previewlanguage": "json",
+                            "header": [{"key": "Content-Type", "value": "application/json"}],
+                            "body": "{\n    \"error\": \"userId is required\"\n}"
+                        }
+                    ]
+                },
+
+                {
+                    "name": "04 Bad Request — Empty body string",
+                    "event": [
+                        {
+                            "listen": "test",
+                            "script": {
+                                "type": "text/javascript",
+                                "exec": [
+                                    "pm.test('Status is 400', () => pm.response.to.have.status(400));",
+                                    "",
+                                    "pm.test('Response is valid JSON', () => {",
+                                    "    pm.expect(pm.response.json()).to.be.an('object');",
+                                    "});"
+                                ]
+                            }
+                        }
+                    ],
+                    "request": {
+                        "method": "POST",
+                        "header": [
+                            {"key": "Authorization", "value": "Bearer {{admin_token}}"},
+                            {"key": "Content-Type", "value": "application/json"}
+                        ],
+                        "body": {
+                            "mode": "raw",
+                            "raw": "",
+                            "options": { "raw": { "language": "json" } }
+                        },
+                        "url": {
+                            "raw": "{{base_url}}/admin/archive",
+                            "host": ["{{base_url}}"],
+                            "path": ["admin", "archive"]
+                        },
+                        "description": "Body is an empty string `\"\"`. Lambda treats `event.body = \"\"` as `{}` (via `or \"{}\"` fallback) — no `userId` found → 400."
+                    },
+                    "response": [
+                        {
+                            "name": "400 — Empty body",
+                            "originalRequest": {
+                                "method": "POST",
+                                "header": [{"key": "Content-Type", "value": "application/json"}],
+                                "body": {"mode": "raw", "raw": ""},
+                                "url": {"raw": "https://abc123.execute-api.ap-south-1.amazonaws.com/prod/admin/archive"}
+                            },
+                            "status": "Bad Request",
+                            "code": 400,
+                            "_postman_previewlanguage": "json",
+                            "header": [{"key": "Content-Type", "value": "application/json"}],
+                            "body": "{\n    \"error\": \"userId is required\"\n}"
+                        }
+                    ]
+                },
+
+                {
+                    "name": "05 Bad Request — Malformed JSON body",
+                    "event": [
+                        {
+                            "listen": "test",
+                            "script": {
+                                "type": "text/javascript",
+                                "exec": [
+                                    "pm.test('Status is 400 or 500', () => {",
+                                    "    pm.expect(pm.response.code).to.be.oneOf([400, 500]);",
+                                    "});",
+                                    "",
+                                    "pm.test('Response is valid JSON (not a raw exception)', () => {",
+                                    "    pm.expect(pm.response.json()).to.be.an('object');",
+                                    "});"
+                                ]
+                            }
+                        }
+                    ],
+                    "request": {
+                        "method": "POST",
+                        "header": [
+                            {"key": "Authorization", "value": "Bearer {{admin_token}}"},
+                            {"key": "Content-Type", "value": "application/json"}
+                        ],
+                        "body": {
+                            "mode": "raw",
+                            "raw": "not-json-at-all{",
+                            "options": { "raw": { "language": "text" } }
+                        },
+                        "url": {
+                            "raw": "{{base_url}}/admin/archive",
+                            "host": ["{{base_url}}"],
+                            "path": ["admin", "archive"]
+                        },
+                        "description": "Body is not valid JSON at all. Lambda must not crash — it returns a structured error response (400 or 500), never a raw Python exception."
+                    },
+                    "response": [
+                        {
+                            "name": "400/500 — Malformed JSON",
+                            "originalRequest": {
+                                "method": "POST",
+                                "header": [{"key": "Content-Type", "value": "application/json"}],
+                                "body": {"mode": "raw", "raw": "not-json-at-all{"},
+                                "url": {"raw": "https://abc123.execute-api.ap-south-1.amazonaws.com/prod/admin/archive"}
+                            },
+                            "status": "Bad Request",
+                            "code": 400,
+                            "_postman_previewlanguage": "json",
+                            "header": [{"key": "Content-Type", "value": "application/json"}],
+                            "body": "{\n    \"error\": \"userId is required\"\n}"
+                        }
+                    ]
+                },
+
+                {
+                    "name": "06 Bad Request — userId not found in user_data (ValueError → 400)",
+                    "event": [
+                        {
+                            "listen": "test",
+                            "script": {
+                                "type": "text/javascript",
+                                "exec": [
+                                    "pm.test('Status is 400', () => pm.response.to.have.status(400));",
+                                    "",
+                                    "const body = pm.response.json();",
+                                    "",
+                                    "pm.test('error field present', () => {",
+                                    "    pm.expect(body).to.have.property('error');",
+                                    "    pm.expect(body.error).to.be.a('string').and.not.empty;",
+                                    "});"
+                                ]
+                            }
+                        }
+                    ],
+                    "request": {
+                        "method": "POST",
+                        "header": [
+                            {"key": "Authorization", "value": "Bearer {{admin_token}}"},
+                            {"key": "Content-Type", "value": "application/json"}
+                        ],
+                        "body": {
+                            "mode": "raw",
+                            "raw": "{\n    \"userId\": \"non-existent-user-id-00000\"\n}",
+                            "options": { "raw": { "language": "json" } }
+                        },
+                        "url": {
+                            "raw": "{{base_url}}/admin/archive",
+                            "host": ["{{base_url}}"],
+                            "path": ["admin", "archive"]
+                        },
+                        "description": "Passes a syntactically valid `userId` that does not exist in `digilux_honeywell_user_data`.\n\n`archive_user` raises `ValueError(\"userId=... not found in user_data\")`. The handler catches `ValueError` and returns 400.\n\nAlso covers the case where the user exists but `status != INACTIVE`."
+                    },
+                    "response": [
+                        {
+                            "name": "400 — User not found / not inactive",
+                            "originalRequest": {
+                                "method": "POST",
+                                "header": [{"key": "Content-Type", "value": "application/json"}],
+                                "body": {"mode": "raw", "raw": "{\n    \"userId\": \"non-existent-user-id-00000\"\n}"},
+                                "url": {"raw": "https://abc123.execute-api.ap-south-1.amazonaws.com/prod/admin/archive"}
+                            },
+                            "status": "Bad Request",
+                            "code": 400,
+                            "_postman_previewlanguage": "json",
+                            "header": [{"key": "Content-Type", "value": "application/json"}],
+                            "body": "{\n    \"error\": \"userId=non-existent-user-id-00000 not found in user_data\"\n}"
+                        }
+                    ]
+                },
+
+                {
+                    "name": "07 Server Error — Verification failure aborts hard-delete (500)",
+                    "event": [
+                        {
+                            "listen": "test",
+                            "script": {
+                                "type": "text/javascript",
+                                "exec": [
+                                    "pm.test('Status is 500', () => pm.response.to.have.status(500));",
+                                    "",
+                                    "const body = pm.response.json();",
+                                    "",
+                                    "pm.test('error mentions verification', () => {",
+                                    "    pm.expect(body.error.toLowerCase()).to.include('verification');",
+                                    "});",
+                                    "",
+                                    "pm.test('error mentions hard-delete aborted', () => {",
+                                    "    pm.expect(body.error.toLowerCase()).to.include('aborted');",
+                                    "});"
+                                ]
+                            }
+                        }
+                    ],
+                    "request": {
+                        "method": "POST",
+                        "header": [
+                            {"key": "Authorization", "value": "Bearer {{admin_token}}"},
+                            {"key": "Content-Type", "value": "application/json"}
+                        ],
+                        "body": {
+                            "mode": "raw",
+                            "raw": "{\n    \"userId\": \"{{target_user_id}}\"\n}",
+                            "options": { "raw": { "language": "json" } }
+                        },
+                        "url": {
+                            "raw": "{{base_url}}/admin/archive",
+                            "host": ["{{base_url}}"],
+                            "path": ["admin", "archive"]
+                        },
+                        "description": "This scenario occurs when the S3 archive write appears to succeed but `head_object` verification fails (e.g., eventual consistency, partial write, or S3 permissions issue).\n\n`VerificationError` is raised and the handler returns 500 with a message explicitly stating that **hard-delete was aborted** — source data is preserved.\n\n**To reproduce in test:** restrict the Lambda IAM role's `s3:HeadObject` permission temporarily on the archive bucket, then trigger a force-archive.\n\n> This is the safety gate that prevents data loss without a confirmed backup."
+                    },
+                    "response": [
+                        {
+                            "name": "500 — Verification failed, hard-delete aborted",
+                            "originalRequest": {
+                                "method": "POST",
+                                "header": [{"key": "Content-Type", "value": "application/json"}],
+                                "body": {"mode": "raw", "raw": "{\n    \"userId\": \"cognito-sub-uuid-abc-123\"\n}"},
+                                "url": {"raw": "https://abc123.execute-api.ap-south-1.amazonaws.com/prod/admin/archive"}
+                            },
+                            "status": "Internal Server Error",
+                            "code": 500,
+                            "_postman_previewlanguage": "json",
+                            "header": [{"key": "Content-Type", "value": "application/json"}],
+                            "body": "{\n    \"error\": \"Archive verification failed — hard-delete aborted. Archive file missing: archive/cognito-sub-uuid-abc-123/dynamodb/device_data.json\"\n}"
+                        }
+                    ]
+                }
+
+            ]
+        },
+
+        {
+            "name": "CORS Preflight",
+            "description": "OPTIONS pre-flight requests — these must return 200 with the correct `Access-Control-Allow-*` headers for browser clients.",
+            "item": [
+
+                {
+                    "name": "OPTIONS /account  (Phase 1 preflight)",
+                    "event": [
+                        {
+                            "listen": "test",
+                            "script": {
+                                "type": "text/javascript",
+                                "exec": [
+                                    "pm.test('Status is 200 or 204', () => {",
+                                    "    pm.expect(pm.response.code).to.be.oneOf([200, 204]);",
+                                    "});",
+                                    "",
+                                    "pm.test('Access-Control-Allow-Origin is *', () => {",
+                                    "    pm.expect(pm.response.headers.get('Access-Control-Allow-Origin')).to.eql('*');",
+                                    "});",
+                                    "",
+                                    "pm.test('Access-Control-Allow-Methods includes DELETE', () => {",
+                                    "    const methods = pm.response.headers.get('Access-Control-Allow-Methods') || '';",
+                                    "    pm.expect(methods.toUpperCase()).to.include('DELETE');",
+                                    "});"
+                                ]
+                            }
+                        }
+                    ],
+                    "request": {
+                        "method": "OPTIONS",
+                        "header": [
+                            {"key": "Origin", "value": "https://app.digilux.com"},
+                            {"key": "Access-Control-Request-Method", "value": "DELETE"},
+                            {"key": "Access-Control-Request-Headers", "value": "Authorization,Content-Type"}
+                        ],
+                        "url": {
+                            "raw": "{{base_url}}/account",
+                            "host": ["{{base_url}}"],
+                            "path": ["account"]
+                        },
+                        "description": "Browser CORS preflight for the Phase 1 `DELETE /account` endpoint.\n\nAPI Gateway must be configured with CORS to return `Access-Control-Allow-Origin: *` and `Access-Control-Allow-Methods: DELETE,OPTIONS`."
+                    },
+                    "response": [
+                        {
+                            "name": "200 — CORS preflight allowed",
+                            "originalRequest": {
+                                "method": "OPTIONS",
+                                "header": [{"key": "Origin", "value": "https://app.digilux.com"}],
+                                "url": {"raw": "https://abc123.execute-api.ap-south-1.amazonaws.com/prod/account"}
+                            },
+                            "status": "OK",
+                            "code": 200,
+                            "_postman_previewlanguage": "text",
+                            "header": [
+                                {"key": "Access-Control-Allow-Origin", "value": "*"},
+                                {"key": "Access-Control-Allow-Methods", "value": "DELETE,OPTIONS"},
+                                {"key": "Access-Control-Allow-Headers", "value": "Authorization,Content-Type"}
+                            ],
+                            "body": ""
+                        }
+                    ]
+                },
+
+                {
+                    "name": "OPTIONS /admin/archive  (Phase 2 preflight)",
+                    "event": [
+                        {
+                            "listen": "test",
+                            "script": {
+                                "type": "text/javascript",
+                                "exec": [
+                                    "pm.test('Status is 200 or 204', () => {",
+                                    "    pm.expect(pm.response.code).to.be.oneOf([200, 204]);",
+                                    "});",
+                                    "",
+                                    "pm.test('Access-Control-Allow-Origin is *', () => {",
+                                    "    pm.expect(pm.response.headers.get('Access-Control-Allow-Origin')).to.eql('*');",
+                                    "});",
+                                    "",
+                                    "pm.test('Access-Control-Allow-Methods includes POST', () => {",
+                                    "    const methods = pm.response.headers.get('Access-Control-Allow-Methods') || '';",
+                                    "    pm.expect(methods.toUpperCase()).to.include('POST');",
+                                    "});"
+                                ]
+                            }
+                        }
+                    ],
+                    "request": {
+                        "method": "OPTIONS",
+                        "header": [
+                            {"key": "Origin", "value": "https://admin.digilux.com"},
+                            {"key": "Access-Control-Request-Method", "value": "POST"},
+                            {"key": "Access-Control-Request-Headers", "value": "Authorization,Content-Type"}
+                        ],
+                        "url": {
+                            "raw": "{{base_url}}/admin/archive",
+                            "host": ["{{base_url}}"],
+                            "path": ["admin", "archive"]
+                        },
+                        "description": "Browser CORS preflight for the Phase 2 `POST /admin/archive` endpoint.\n\nExpects `Access-Control-Allow-Methods: POST,OPTIONS`."
+                    },
+                    "response": [
+                        {
+                            "name": "200 — CORS preflight allowed",
+                            "originalRequest": {
+                                "method": "OPTIONS",
+                                "header": [{"key": "Origin", "value": "https://admin.digilux.com"}],
+                                "url": {"raw": "https://abc123.execute-api.ap-south-1.amazonaws.com/prod/admin/archive"}
+                            },
+                            "status": "OK",
+                            "code": 200,
+                            "_postman_previewlanguage": "text",
+                            "header": [
+                                {"key": "Access-Control-Allow-Origin", "value": "*"},
+                                {"key": "Access-Control-Allow-Methods", "value": "POST,OPTIONS"},
+                                {"key": "Access-Control-Allow-Headers", "value": "Authorization,Content-Type"}
+                            ],
+                            "body": ""
+                        }
+                    ]
+                }
+
+            ]
+        }
+
+    ]
+}

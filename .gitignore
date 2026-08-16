@@ -1,0 +1,14 @@
+/lambda_function.py
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Env / secrets
+.env
+*.env
+
+# OS
+.DS_Store

@@ -12,3 +12,12 @@ __pycache__/
 
 # OS
 .DS_Store
+
+# Terraform
+infra/.terraform/
+infra/.terraform.lock.hcl
+infra/.builds/*.zip
+infra/.builds/*.tfplan
+infra/terraform.tfstate
+infra/terraform.tfstate.backup
+infra/crash.log

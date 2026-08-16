@@ -1064,4 +1064,547 @@ To verify that a user's deletion is fully complete:
 
 ---
 
+## 9. Deployment Guide (DevOps Handover)
+
+This section is for the **DevOps / Infrastructure team** responsible for deploying and maintaining this feature. Everything needed to go from zero to production is here.
+
+---
+
+### 9.1 Prerequisites
+
+Install and configure the following tools before you start.
+
+| Tool | Minimum version | Install |
+|---|---|---|
+| AWS CLI | v2.x | `brew install awscli` |
+| Terraform | >= 1.6.0 | `brew tap hashicorp/tap && brew install hashicorp/tap/terraform` |
+| Python | 3.12 | `brew install python@3.12` |
+| make | any | Pre-installed on macOS/Linux |
+
+**AWS CLI configuration:**
+
+```bash
+aws configure --profile digilux
+# AWS Access Key ID:     <your key>
+# AWS Secret Access Key: <your secret>
+# Default region:        ap-south-1
+# Default output format: json
+```
+
+Set the profile for the session:
+```bash
+export AWS_PROFILE=digilux
+```
+
+For Honeywell client deployment, configure a separate profile:
+```bash
+aws configure --profile honeywell
+export AWS_PROFILE=honeywell
+```
+
+**Minimum IAM permissions required for the deploying user/role:**
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    { "Effect": "Allow", "Action": "dynamodb:*",        "Resource": "*" },
+    { "Effect": "Allow", "Action": "s3:*",              "Resource": "*" },
+    { "Effect": "Allow", "Action": "lambda:*",          "Resource": "*" },
+    { "Effect": "Allow", "Action": "apigateway:*",      "Resource": "*" },
+    { "Effect": "Allow", "Action": "iam:*",             "Resource": "*" },
+    { "Effect": "Allow", "Action": "scheduler:*",       "Resource": "*" },
+    { "Effect": "Allow", "Action": "logs:*",            "Resource": "*" },
+    { "Effect": "Allow", "Action": "cloudwatch:*",      "Resource": "*" },
+    { "Effect": "Allow", "Action": "sns:*",             "Resource": "*" },
+    { "Effect": "Allow", "Action": "cognito-idp:List*", "Resource": "*" }
+  ]
+}
+```
+
+> In practice, scope this to specific resources. The above is the broadest safe policy for initial deployment.
+
+---
+
+### 9.2 Repository structure
+
+```
+digilux-delete-account/
+│
+├── Makefile                          ← All deployment commands live here
+│
+├── phase1/
+│   └── lambda_function.py            ← Phase 1 Lambda source
+│
+├── phase2/
+│   ├── lambda_function.py            ← Phase 2 Lambda handler
+│   └── archiver.py                   ← Phase 2 archive/delete engine
+│
+├── infra/
+│   ├── main.tf                       ← Provider + S3 backend
+│   ├── variables.tf                  ← All input variables
+│   ├── locals.tf                     ← Naming + tag conventions
+│   ├── dynamodb.tf                   ← deletion_audit DynamoDB table
+│   ├── s3.tf                         ← Archive S3 bucket
+│   ├── iam.tf                        ← IAM roles + policies
+│   ├── lambda.tf                     ← Lambda functions (auto-zips source)
+│   ├── api_gateway.tf                ← REST API + Cognito authorizer + CORS
+│   ├── eventbridge.tf                ← Daily 02:00 UTC sweep schedule
+│   ├── cloudwatch.tf                 ← Log groups + metric alarms
+│   ├── outputs.tf                    ← API URL, Lambda ARNs, etc.
+│   ├── .builds/                      ← Auto-generated zip files (gitignored)
+│   └── envs/
+│       ├── digilux.tfvars            ← Digilux environment variables
+│       ├── digilux-backend.hcl       ← Digilux Terraform state config
+│       ├── honeywell.tfvars          ← Honeywell client variables
+│       └── honeywell-backend.hcl     ← Honeywell Terraform state config
+│
+├── tests/                            ← 107 unit tests (run before deploy)
+├── postman/                          ← Postman collection for API testing
+└── docs/
+    └── ACCOUNT_DELETION.md           ← This document
+```
+
+---
+
+### 9.3 One-time bootstrap (first deploy only)
+
+Terraform stores its state in S3 and uses DynamoDB for state locking. These resources must exist **before** running any Terraform command. Create them once — they are shared across all environments.
+
+```bash
+# 1. Create the Terraform state S3 bucket
+aws s3 mb s3://digilux-terraform-state \
+    --region ap-south-1
+
+# Enable versioning on the state bucket (protects against accidental state loss)
+aws s3api put-bucket-versioning \
+    --bucket digilux-terraform-state \
+    --versioning-configuration Status=Enabled
+
+# Block all public access
+aws s3api put-public-access-block \
+    --bucket digilux-terraform-state \
+    --public-access-block-configuration \
+      BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+
+# 2. Create the state lock DynamoDB table
+aws dynamodb create-table \
+    --table-name terraform-state-lock \
+    --attribute-definitions AttributeName=LockID,AttributeType=S \
+    --key-schema AttributeName=LockID,KeyType=HASH \
+    --billing-mode PAY_PER_REQUEST \
+    --region ap-south-1
+```
+
+> This only needs to be done **once per AWS account**, not per environment.
+
+---
+
+### 9.4 Clone the repository
+
+```bash
+git clone https://github.com/mahesh-maney/digilux-delete-account.git
+cd digilux-delete-account
+```
+
+---
+
+### 9.5 Deploy to Digilux environment
+
+#### Step 1 — Review the variables
+
+Open `infra/envs/digilux.tfvars` and confirm the values are correct:
+
+```hcl
+env                  = "digilux"
+aws_region           = "ap-south-1"
+cognito_user_pool_id = "ap-south-1_KJpJMEzyM"   # ← confirm this is correct
+table_prefix         = "digilux_honeywell"
+bucket_prefix        = "digilux-honeywell"
+lambda_runtime       = "python3.12"
+phase1_timeout       = 29
+phase2_timeout       = 300
+lambda_memory_mb     = 512
+archive_expiry_days  = 2555
+alert_email          = ""                          # ← set your ops email here
+```
+
+#### Step 2 — Run the tests
+
+Always run unit tests before deploying. They catch Lambda regressions before any code reaches AWS.
+
+```bash
+python3 -m unittest discover tests/ -v
+```
+
+Expected output: `Ran 107 tests in X.XXXs  OK`
+
+If any test fails, **do not deploy**. Fix the issue first.
+
+#### Step 3 — Deploy
+
+```bash
+make deploy ENV=digilux
+```
+
+This runs three steps in sequence:
+1. `terraform init` — downloads providers, connects to S3 backend
+2. `terraform plan` — shows exactly what will be created/changed (review carefully)
+3. `terraform apply` — applies the plan
+
+The first-time plan will show **~20 resources to create**. Review the diff and confirm.
+
+#### Step 4 — Collect outputs
+
+```bash
+make output ENV=digilux
+```
+
+Example output:
+```
+api_base_url             = "https://abc123.execute-api.ap-south-1.amazonaws.com/digilux"
+phase1_endpoint          = "https://abc123.execute-api.ap-south-1.amazonaws.com/digilux/account"
+phase2_admin_endpoint    = "https://abc123.execute-api.ap-south-1.amazonaws.com/digilux/admin/archive"
+admin_api_key            = <sensitive>
+archive_bucket           = "digilux-honeywell-archive"
+deletion_audit_table     = "digilux_honeywell_deletion_audit"
+phase1_log_group         = "/aws/lambda/digilux-delete-account-phase1"
+phase2_log_group         = "/aws/lambda/digilux-delete-account-phase2"
+eventbridge_schedule_name = "digilux-delete-account-daily-sweep"
+```
+
+To see the sensitive admin API key:
+```bash
+terraform -chdir=infra output -raw admin_api_key
+```
+
+**Save these values** — share the API endpoints with the integration team and the admin API key with whoever manages the admin tooling.
+
+---
+
+### 9.6 Deploy to Honeywell client environment
+
+#### Step 1 — Fill in the Honeywell variables
+
+Open `infra/envs/honeywell.tfvars` and replace the placeholder values:
+
+```hcl
+env                  = "honeywell"
+aws_region           = "ap-south-1"
+cognito_user_pool_id = "REPLACE_WITH_HONEYWELL_USER_POOL_ID"  # ← required
+table_prefix         = "digilux_honeywell"
+bucket_prefix        = "digilux-honeywell"
+alert_email          = "ops@honeywell-client.com"              # ← recommended
+```
+
+**How to find the Honeywell Cognito User Pool ID:**
+
+```bash
+aws cognito-idp list-user-pools --max-results 20 --region ap-south-1
+```
+
+Look for the pool used by the Honeywell app. Copy the `Id` value (format: `ap-south-1_XXXXXXXXX`).
+
+#### Step 2 — Switch AWS profile to Honeywell account (if different account)
+
+```bash
+export AWS_PROFILE=honeywell
+```
+
+If deploying into the **same AWS account** as Digilux (common for initial setup), leave the profile unchanged. The Terraform state key (`delete-account/honeywell/terraform.tfstate`) keeps the states separate.
+
+#### Step 3 — Run tests and deploy
+
+```bash
+python3 -m unittest discover tests/ -v
+make deploy ENV=honeywell
+```
+
+#### Step 4 — Collect outputs
+
+```bash
+make output ENV=honeywell
+```
+
+The Honeywell deployment creates its own set of resources with `honeywell-` prefix — fully isolated from the Digilux deployment.
+
+---
+
+### 9.7 Adding a future client environment
+
+To deploy for a new client (e.g., `acme`):
+
+**Step 1** — Create the var file:
+```bash
+cp infra/envs/honeywell.tfvars infra/envs/acme.tfvars
+```
+
+**Step 2** — Edit `infra/envs/acme.tfvars`:
+```hcl
+env                  = "acme"
+cognito_user_pool_id = "ap-south-1_NEWPOOLID"
+alert_email          = "ops@acme.com"
+```
+
+**Step 3** — Create the backend config:
+```bash
+cp infra/envs/honeywell-backend.hcl infra/envs/acme-backend.hcl
+```
+
+Edit `infra/envs/acme-backend.hcl`:
+```hcl
+key = "delete-account/acme/terraform.tfstate"
+```
+
+**Step 4** — Deploy:
+```bash
+make deploy ENV=acme
+```
+
+No Terraform code changes are needed. All naming is driven by `var.env`.
+
+---
+
+### 9.8 Updating Lambda code
+
+When the Lambda source code changes (bug fix, new feature):
+
+```bash
+# 1. Run tests
+python3 -m unittest discover tests/ -v
+
+# 2. Redeploy — Terraform detects the source_code_hash change and re-uploads
+make deploy ENV=digilux
+```
+
+Terraform's `source_code_hash` on each Lambda resource compares the SHA256 of the zip file. If the code has not changed, Lambda is not redeployed. If the code changed, only the Lambda update is applied — no other resources are touched.
+
+To redeploy to Honeywell at the same time:
+```bash
+make deploy ENV=digilux && make deploy ENV=honeywell
+```
+
+---
+
+### 9.9 Post-deployment verification checklist
+
+Run this after every deployment to confirm the environment is healthy.
+
+#### Infrastructure checks
+
+```bash
+# Confirm Lambda functions exist
+aws lambda get-function --function-name digilux-delete-account-phase1
+aws lambda get-function --function-name digilux-delete-account-phase2
+
+# Confirm DynamoDB table exists
+aws dynamodb describe-table --table-name digilux_honeywell_deletion_audit
+
+# Confirm archive S3 bucket exists
+aws s3 ls s3://digilux-honeywell-archive
+
+# Confirm EventBridge schedule exists
+aws scheduler get-schedule --name digilux-delete-account-daily-sweep
+```
+
+#### API smoke test (using Postman collection)
+
+Import `postman/digilux-account-deletion.postman_collection.json` and `postman/digilux-dev.postman_environment.json` into Postman.
+
+Set environment variables:
+- `api_id` — from `make output` → `api_base_url` (extract the ID before `.execute-api`)
+- `stage` — `digilux` (or `honeywell`)
+- `cognito_client_id` — Cognito App Client ID
+- `test_username` / `test_password` — a real test user in the Cognito pool
+
+Run **Auth → Get Cognito Token** first, then run the following in order:
+
+```
+[ ] Auth → Get Cognito Token                      → 200, user_jwt populated
+[ ] Phase 1 → 03 Unauthorized — No Auth Header   → 401
+[ ] Phase 1 → 04 Malformed JWT                   → 401
+[ ] Phase 2 → 02 Bad Request — Missing userId    → 400
+[ ] CORS → OPTIONS /account                      → 200, CORS headers present
+[ ] CORS → OPTIONS /admin/archive                → 200, CORS headers present
+```
+
+> Do **not** run the happy-path deletion test against a real user in production. Use a dedicated test account.
+
+#### CloudWatch check
+
+```bash
+# Confirm log groups exist
+aws logs describe-log-groups \
+    --log-group-name-prefix /aws/lambda/digilux-delete-account
+
+# Confirm no errors in the last 5 minutes (should be empty on fresh deploy)
+aws logs filter-log-events \
+    --log-group-name /aws/lambda/digilux-delete-account-phase1 \
+    --start-time $(date -v-5M +%s000) \
+    --filter-pattern "ERROR"
+```
+
+---
+
+### 9.10 Makefile reference
+
+| Command | What it does |
+|---|---|
+| `make deploy ENV=digilux` | Full deploy: init → plan → apply → print outputs |
+| `make init ENV=digilux` | Initialise Terraform backend only |
+| `make plan ENV=digilux` | Generate and save a plan to `infra/.builds/digilux.tfplan` |
+| `make apply ENV=digilux` | Apply the previously saved plan |
+| `make output ENV=digilux` | Print all Terraform outputs |
+| `make fmt` | Auto-format all `.tf` files in place |
+| `make validate ENV=digilux` | Validate HCL syntax (no AWS calls) |
+| `make destroy ENV=digilux` | Destroy all resources (see warning below) |
+
+---
+
+### 9.11 Destroying an environment
+
+```bash
+make destroy ENV=digilux
+```
+
+> **Important:** The `deletion_audit` DynamoDB table and the `archive` S3 bucket both have `prevent_destroy = true` in Terraform. Running `destroy` will remove Lambdas, API Gateway, EventBridge, IAM roles, and CloudWatch resources — **but the audit table and archive bucket will be refused by Terraform**. This is intentional — audit trails and archived data must never be accidentally lost.
+
+To destroy those two resources you must first manually remove the `lifecycle { prevent_destroy = true }` block from `dynamodb.tf` and `s3.tf`, then re-run `make apply` followed by `make destroy`. **This should never be done in production without explicit written approval.**
+
+---
+
+### 9.12 Environment variables injected into Lambda
+
+These are set automatically by Terraform from `locals.tf`. You do not need to configure them manually.
+
+**Phase 1 Lambda:**
+
+| Variable | Value (digilux) |
+|---|---|
+| `USER_POOL_ID` | `ap-south-1_KJpJMEzyM` |
+| `TABLE_USER_DATA` | `digilux_honeywell_user_data` |
+| `TABLE_DEVICE_DATA` | `digilux_honeywell_device_data` |
+| `TABLE_DELETION_AUDIT` | `digilux_honeywell_deletion_audit` |
+
+**Phase 2 Lambda:**
+
+| Variable | Value (digilux) |
+|---|---|
+| `TABLE_USER_DATA` | `digilux_honeywell_user_data` |
+| `TABLE_DEVICE_DATA` | `digilux_honeywell_device_data` |
+| `TABLE_SCENE_DATA` | `digilux_honeywell_scene_data` |
+| `TABLE_USER_DEVICE_DETAILS` | `digilux_honeywell_user_device_details` |
+| `TABLE_USER_DEVICE_MAPPING` | `digilux_honeywell_user_device_mapping` |
+| `TABLE_USER_SUBUSER_DETAIL` | `digilux_honeywell_user_subuser_detail` |
+| `TABLE_USER_SUBUSER_MAPPING` | `digilux_honeywell_user_subuser_mapping` |
+| `TABLE_SUBUSER_ROLE_DATA` | `digilux_honeywell_subuser_role_data` |
+| `TABLE_ADMIN_OTP_DATA` | `digilux_honeywell_admin_otp_data` |
+| `TABLE_ALEXA_LWA_TOKENS` | `digilux_honeywell_alexa_lwa_tokens` |
+| `TABLE_DEVICE_STATE` | `digilux_honeywell_device_state` |
+| `TABLE_ENTITY_STATE` | `digilux_honeywell_entity_state` |
+| `TABLE_AUTOMATION_EVENT` | `digilux_honeywell_automation_event` |
+| `TABLE_AUTOMATION_SCHEDULE_DIRECT` | `digilux_honeywell_automation_schedule_direct` |
+| `TABLE_AUTOMATION_SCHEDULE_CTRL` | `digilux_honeywell_automation_schedule_controller` |
+| `TABLE_DELETION_AUDIT` | `digilux_honeywell_deletion_audit` |
+| `ARCHIVE_BUCKET` | `digilux-honeywell-archive` |
+| `METADATA_BUCKET` | `digilux-honeywell-metadata` |
+
+All values change automatically for other environments based on `table_prefix` and `bucket_prefix` in the `.tfvars` file.
+
+---
+
+### 9.13 Rollback procedure
+
+#### Roll back Lambda to previous code version
+
+```bash
+# List available Lambda versions
+aws lambda list-versions-by-function \
+    --function-name digilux-delete-account-phase1
+
+# Publish a version from current code (Terraform does not publish versions by default)
+# If you need instant rollback capability, enable publish=true in lambda.tf first.
+
+# Quickest rollback: redeploy from the previous Git commit
+git log --oneline -10
+git checkout <previous-commit-hash> -- phase1/ phase2/
+make deploy ENV=digilux
+git checkout HEAD -- phase1/ phase2/   # restore latest
+```
+
+#### Roll back Terraform state
+
+If a `terraform apply` partially fails and leaves state inconsistent:
+
+```bash
+# 1. Check current state
+terraform -chdir=infra state list
+
+# 2. Remove a specific broken resource from state (does NOT delete the AWS resource)
+terraform -chdir=infra state rm aws_lambda_function.phase1
+
+# 3. Re-import if needed
+terraform -chdir=infra import \
+    -var-file=envs/digilux.tfvars \
+    aws_lambda_function.phase1 \
+    digilux-delete-account-phase1
+
+# 4. Re-run plan to confirm state is clean
+make plan ENV=digilux
+```
+
+---
+
+### 9.14 Common deployment errors
+
+---
+
+**Error:** `Error: S3 bucket not found` during `terraform init`
+
+**Fix:** The state bucket does not exist yet. Run the bootstrap commands in Section 9.3.
+
+---
+
+**Error:** `Error: error creating Lambda Function: InvalidParameterValueException: The runtime provided is not supported`
+
+**Fix:** Change `lambda_runtime` in your `.tfvars` to a currently supported value (e.g., `python3.12`). Check supported runtimes at https://docs.aws.amazon.com/lambda/latest/dg/lambda-runtimes.html
+
+---
+
+**Error:** `Error: AccessDeniedException: User is not authorized to perform: iam:CreateRole`
+
+**Fix:** The deploying IAM user/role is missing IAM permissions. Attach the policy described in Section 9.1.
+
+---
+
+**Error:** `Error: Error creating API Gateway Deployment: BadRequestException: The REST API doesn't contain any methods`
+
+**Fix:** This is a Terraform ordering issue. Run `make plan ENV=<env>` followed by `make apply ENV=<env>` again. The `depends_on` blocks in `api_gateway.tf` should prevent this — if it recurs, add a `time_sleep` resource after the method resources.
+
+---
+
+**Error:** `Error: ConflictException: Schedule digilux-delete-account-daily-sweep already exists`
+
+**Fix:** The EventBridge schedule already exists from a previous manual deployment. Import it into Terraform state:
+```bash
+terraform -chdir=infra import \
+    -var-file=envs/digilux.tfvars \
+    aws_scheduler_schedule.daily_sweep \
+    default/digilux-delete-account-daily-sweep
+```
+
+---
+
+### 9.15 Support escalation
+
+| Issue | Who to contact |
+|---|---|
+| Terraform state corruption | Platform team (Mahesh) |
+| Lambda code bug | Platform team (Mahesh) |
+| Cognito User Pool ID | Client account owner / Honeywell team |
+| AWS account credentials | DevOps lead |
+| Postman collection / API questions | See Section 4 of this document |
+
+---
+
 *For questions or escalations, contact the Digilux Platform Team.*

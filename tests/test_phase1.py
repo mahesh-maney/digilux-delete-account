@@ -1,6 +1,7 @@
 """
 Phase 1 — Account Deletion Lambda Tests
-Covers: auth, idempotency, sign-out, mark-INACTIVE, device release, Cognito delete, audit log.
+Covers: auth, idempotency, sign-out, mark-INACTIVE, device unbind, Cognito disable,
+        deletion token, deletion evidence, deletion-status endpoint.
 """
 
 import sys
@@ -117,12 +118,12 @@ class TestIdempotency(unittest.TestCase):
         self.assertEqual(resp["statusCode"], 200)
         self.assertEqual(json.loads(resp["body"])["status"], "already_processed")
 
-    def test_already_inactive_does_not_call_cognito_delete(self):
+    def test_already_inactive_does_not_call_cognito_disable(self):
         mock_cog = _mock_cognito()
         with patch.object(handler, 'dynamodb', _mock_db(user_status="INACTIVE")), \
              patch.object(handler, 'cognito_idp', mock_cog):
             handler.lambda_handler(_event(), None)
-        mock_cog.admin_delete_user.assert_not_called()
+        mock_cog.admin_disable_user.assert_not_called()
 
     def test_idempotency_db_failure_continues_to_deletion(self):
         """If the idempotency get_item fails, Phase 1 should still proceed."""
@@ -165,11 +166,17 @@ class TestHappyPath(unittest.TestCase):
             UserPoolId=handler.USER_POOL_ID, Username=USER_ID
         )
 
-    def test_cognito_delete_called_with_correct_user(self):
+    def test_cognito_disable_called_with_correct_user(self):
+        """Phase 1 must call admin_disable_user (not admin_delete_user)."""
         _, _, mock_cog = self._run()
-        mock_cog.admin_delete_user.assert_called_once_with(
+        mock_cog.admin_disable_user.assert_called_once_with(
             UserPoolId=handler.USER_POOL_ID, Username=USER_ID
         )
+
+    def test_cognito_delete_not_called_in_phase1(self):
+        """admin_delete_user must NOT be called in Phase 1 (reserved for Phase 2)."""
+        _, _, mock_cog = self._run()
+        mock_cog.admin_delete_user.assert_not_called()
 
     def test_user_marked_inactive_with_archive_pending_true(self):
         _, mock_db, _ = self._run()
@@ -181,6 +188,96 @@ class TestHappyPath(unittest.TestCase):
         )
         self.assertIsNotNone(inactive_call, "Expected update_item to set status=INACTIVE")
         self.assertTrue(inactive_call.kwargs["ExpressionAttributeValues"].get(":true"))
+
+    def test_deletion_token_stored_in_user_data(self):
+        """deletionToken must be written into user_data during the INACTIVE update."""
+        _, mock_db, _ = self._run()
+        update_calls = mock_db.Table.return_value.update_item.call_args_list
+        inactive_call = next(
+            (c for c in update_calls
+             if c.kwargs.get("ExpressionAttributeValues", {}).get(":inactive") == "INACTIVE"),
+            None
+        )
+        self.assertIsNotNone(inactive_call)
+        self.assertIn(":tok", inactive_call.kwargs["ExpressionAttributeValues"])
+
+    def test_deletion_token_returned_in_response(self):
+        """Response body must include a non-empty deletionToken UUID."""
+        resp, _, _ = self._run()
+        body = json.loads(resp["body"])
+        self.assertIn("deletionToken", body)
+        self.assertTrue(body["deletionToken"])
+
+    def test_deletion_evidence_written(self):
+        """deletion_evidence put_item must be called with deletionToken and userId."""
+        _, mock_db, _ = self._run()
+        put_calls = mock_db.Table.return_value.put_item.call_args_list
+        evidence_call = next(
+            (c for c in put_calls
+             if "deletionToken" in c.kwargs.get("Item", {})),
+            None
+        )
+        self.assertIsNotNone(evidence_call, "Expected put_item with deletionToken (deletion_evidence)")
+        item = evidence_call.kwargs["Item"]
+        self.assertEqual(item["userId"], USER_ID)
+
+    def test_deletion_evidence_has_ip_address_and_user_agent(self):
+        """deletion_evidence must capture ipAddress and userAgent for the compliance trail."""
+        mock_db  = _mock_db()
+        mock_cog = _mock_cognito()
+        event = {
+            "headers":        {"Authorization": f"Bearer {_make_jwt()}"},
+            "requestContext": {"identity": {"sourceIp": "203.0.113.10"}},
+        }
+        event["headers"]["User-Agent"] = "MyApp/2.0 iOS/17"
+        with patch.object(handler, 'dynamodb', mock_db), \
+             patch.object(handler, 'cognito_idp', mock_cog):
+            handler.lambda_handler(event, None)
+        put_calls = mock_db.Table.return_value.put_item.call_args_list
+        evidence_item = next(
+            (c.kwargs["Item"] for c in put_calls if "deletionToken" in c.kwargs.get("Item", {})),
+            None
+        )
+        self.assertIsNotNone(evidence_item)
+        self.assertEqual(evidence_item["ipAddress"], "203.0.113.10")
+        self.assertEqual(evidence_item["userAgent"], "MyApp/2.0 iOS/17")
+
+    def test_deletion_token_is_uuid_format(self):
+        """deletionToken in response must be a valid UUID (8-4-4-4-12 hyphen format)."""
+        import re
+        resp, _, _ = self._run()
+        token = json.loads(resp["body"])["deletionToken"]
+        uuid_pattern = r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+        self.assertRegex(token, uuid_pattern, f"deletionToken {token!r} is not a valid UUID")
+
+    def test_device_bindings_backup_written_when_devices_exist(self):
+        """When devices are found, deviceBindingsBackup must be saved to user_data."""
+        devices  = [
+            {"deviceId": "dev-1", "macAddress": "AA:BB:CC"},
+            {"deviceId": "dev-2", "macAddress": "DD:EE:FF"},
+        ]
+        _, mock_db, _ = self._run(devices=devices)
+        update_calls = mock_db.Table.return_value.update_item.call_args_list
+        backup_call = next(
+            (c for c in update_calls
+             if ":b" in c.kwargs.get("ExpressionAttributeValues", {})),
+            None
+        )
+        self.assertIsNotNone(backup_call, "Expected update_item with deviceBindingsBackup")
+        backup = backup_call.kwargs["ExpressionAttributeValues"][":b"]
+        self.assertEqual(len(backup), 2)
+        self.assertEqual(backup[0]["deviceId"], "dev-1")
+
+    def test_audit_log_contains_cognito_disable_status(self):
+        """Audit log must record cognitoDisableStatus so ops can detect disable failures."""
+        _, mock_db, _ = self._run()
+        put_calls = mock_db.Table.return_value.put_item.call_args_list
+        audit_item = next(
+            (c.kwargs["Item"] for c in put_calls if "status" in c.kwargs.get("Item", {})),
+            None
+        )
+        self.assertIsNotNone(audit_item)
+        self.assertIn("cognitoDisableStatus", audit_item)
 
     def test_two_devices_released_with_user_id_zero(self):
         devices = [
@@ -237,7 +334,7 @@ class TestResilience(unittest.TestCase):
              patch.object(handler, 'cognito_idp', mock_cog):
             resp = handler.lambda_handler(_event(), None)
         self.assertEqual(resp["statusCode"], 500)
-        mock_cog.admin_delete_user.assert_not_called()
+        mock_cog.admin_disable_user.assert_not_called()
 
     def test_cognito_not_found_on_sign_out_continues(self):
         mock_cog = _mock_cognito()
@@ -247,9 +344,19 @@ class TestResilience(unittest.TestCase):
             resp = handler.lambda_handler(_event(), None)
         self.assertEqual(resp["statusCode"], 200)
 
-    def test_cognito_not_found_on_delete_continues(self):
+    def test_cognito_not_found_on_disable_continues(self):
+        """UserNotFoundException during admin_disable_user must not abort Phase 1."""
         mock_cog = _mock_cognito()
-        mock_cog.admin_delete_user.side_effect = mock_cog.exceptions.UserNotFoundException()
+        mock_cog.admin_disable_user.side_effect = mock_cog.exceptions.UserNotFoundException()
+        with patch.object(handler, 'dynamodb', _mock_db()), \
+             patch.object(handler, 'cognito_idp', mock_cog):
+            resp = handler.lambda_handler(_event(), None)
+        self.assertEqual(resp["statusCode"], 200)
+
+    def test_cognito_disable_general_exception_continues(self):
+        """Any non-UserNotFoundException during admin_disable_user must not abort Phase 1."""
+        mock_cog = _mock_cognito()
+        mock_cog.admin_disable_user.side_effect = Exception("Cognito service error")
         with patch.object(handler, 'dynamodb', _mock_db()), \
              patch.object(handler, 'cognito_idp', mock_cog):
             resp = handler.lambda_handler(_event(), None)
@@ -312,6 +419,100 @@ class TestResilience(unittest.TestCase):
 
         self.assertEqual(resp["statusCode"], 200)
         self.assertEqual(release_attempts["n"], 3)  # all 3 attempted despite first failure
+
+
+# ── GET /account/deletion-status ──────────────────────────────────────────────
+
+class TestDeletionStatus(unittest.TestCase):
+
+    def _status_event(self, token="test-token-uuid"):
+        return {
+            "httpMethod": "GET",
+            "path": "/account/deletion-status",
+            "queryStringParameters": {"token": token},
+        }
+
+    def _mock_evidence(self, **overrides):
+        base = {
+            "deletionToken": "test-token-uuid",
+            "userId":        USER_ID,
+            "requestedAt":   "2026-08-09T12:00:00+00:00",
+            "ipAddress":     "1.2.3.4",
+            "userAgent":     "TestAgent/1.0",
+        }
+        base.update(overrides)
+        return base
+
+    def test_missing_token_returns_400(self):
+        event = {"httpMethod": "GET", "path": "/account/deletion-status", "queryStringParameters": {}}
+        mock_db = _mock_db()
+        with patch.object(handler, 'dynamodb', mock_db):
+            resp = handler.lambda_handler(event, None)
+        self.assertEqual(resp["statusCode"], 400)
+
+    def test_unknown_token_returns_400(self):
+        mock_db = _mock_db()
+        mock_db.Table.return_value.get_item.return_value = {"Item": None}
+        with patch.object(handler, 'dynamodb', mock_db):
+            resp = handler.lambda_handler(self._status_event("unknown-token"), None)
+        self.assertEqual(resp["statusCode"], 400)
+        self.assertIn("Invalid", json.loads(resp["body"])["error"])
+
+    def test_phase1_complete_status_when_no_archive_timestamps(self):
+        mock_db = _mock_db()
+        mock_db.Table.return_value.get_item.return_value = {"Item": self._mock_evidence()}
+        with patch.object(handler, 'dynamodb', mock_db):
+            resp = handler.lambda_handler(self._status_event(), None)
+        self.assertEqual(resp["statusCode"], 200)
+        self.assertEqual(json.loads(resp["body"])["status"], "PHASE1_COMPLETE")
+
+    def test_phase2_complete_status_when_archive_deleted(self):
+        mock_db = _mock_db()
+        evidence = self._mock_evidence(
+            archiveStartedAt="2026-08-09T13:00:00+00:00",
+            archiveCompletedAt="2026-08-09T13:01:00+00:00",
+            archiveDeletedAt="2026-08-09T13:02:00+00:00",
+        )
+        mock_db.Table.return_value.get_item.return_value = {"Item": evidence}
+        with patch.object(handler, 'dynamodb', mock_db):
+            resp = handler.lambda_handler(self._status_event(), None)
+        self.assertEqual(resp["statusCode"], 200)
+        self.assertEqual(json.loads(resp["body"])["status"], "PHASE2_COMPLETE")
+
+    def test_restored_status_when_restored_at_present(self):
+        mock_db = _mock_db()
+        evidence = self._mock_evidence(restoredAt="2026-08-11T09:00:00+00:00")
+        mock_db.Table.return_value.get_item.return_value = {"Item": evidence}
+        with patch.object(handler, 'dynamodb', mock_db):
+            resp = handler.lambda_handler(self._status_event(), None)
+        self.assertEqual(resp["statusCode"], 200)
+        self.assertEqual(json.loads(resp["body"])["status"], "RESTORED")
+
+    def test_response_includes_requested_at(self):
+        mock_db = _mock_db()
+        mock_db.Table.return_value.get_item.return_value = {"Item": self._mock_evidence()}
+        with patch.object(handler, 'dynamodb', mock_db):
+            resp = handler.lambda_handler(self._status_event(), None)
+        body = json.loads(resp["body"])
+        self.assertIn("requestedAt", body)
+
+    def test_null_query_string_parameters_returns_400(self):
+        """queryStringParameters=None (absent from event) must be handled gracefully."""
+        event = {
+            "httpMethod": "GET",
+            "path":       "/account/deletion-status",
+            "queryStringParameters": None,
+        }
+        with patch.object(handler, 'dynamodb', _mock_db()):
+            resp = handler.lambda_handler(event, None)
+        self.assertEqual(resp["statusCode"], 400)
+
+    def test_status_response_includes_user_id(self):
+        mock_db = _mock_db()
+        mock_db.Table.return_value.get_item.return_value = {"Item": self._mock_evidence()}
+        with patch.object(handler, 'dynamodb', mock_db):
+            resp = handler.lambda_handler(self._status_event(), None)
+        self.assertEqual(json.loads(resp["body"])["userId"], USER_ID)
 
 
 # ── Edge-case / additional negative tests ─────────────────────────────────────

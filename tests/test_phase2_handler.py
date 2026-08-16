@@ -1,6 +1,7 @@
 """
 Phase 2 Lambda Handler Tests
-Covers: EventBridge daily sweep (pagination, failures, empty) and Force-Archive admin API.
+Covers: EventBridge daily sweep (pagination, failures, empty), Force-Archive admin API,
+        and POST /account/restore endpoint.
 """
 
 import sys
@@ -27,7 +28,8 @@ def _load_handler():
 
 handler = _load_handler()
 
-USER_ID = "cognito-sub-uuid-abc-123"
+USER_ID        = "cognito-sub-uuid-abc-123"
+DELETION_TOKEN = "test-deletion-token-uuid"
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -38,6 +40,14 @@ def _force_event(user_id=USER_ID):
 
 def _sweep_event(source="aws.scheduler"):
     return {"source": source}
+
+
+def _restore_event(user_id=USER_ID, token=DELETION_TOKEN):
+    return {
+        "httpMethod": "POST",
+        "path":       "/account/restore",
+        "body":       json.dumps({"userId": user_id, "deletionToken": token}),
+    }
 
 
 def _db_with_users(users, paginated=False):
@@ -57,7 +67,10 @@ class TestForceArchive(unittest.TestCase):
         with patch('phase2_lambda_function.archive_user') as mock_archive:
             resp = handler.lambda_handler(_force_event(), None)
         self.assertEqual(resp["statusCode"], 200)
-        mock_archive.assert_called_once_with(USER_ID, handler.dynamodb, handler.s3_client)
+        mock_archive.assert_called_once_with(
+            USER_ID, handler.dynamodb, handler.s3_client,
+            cognito_client=handler.cognito_client
+        )
 
     def test_success_message_includes_user_id(self):
         with patch('phase2_lambda_function.archive_user'):
@@ -152,6 +165,16 @@ class TestEventBridgeSweep(unittest.TestCase):
         self.assertEqual(result["failed"],    0)
         self.assertEqual(mock_archive.call_count, 2)
 
+    def test_sweep_passes_cognito_client(self):
+        """Sweep must pass cognito_client= so Phase 2 can delete Cognito users."""
+        users = [{"userId": "user-1"}]
+        mock_db = _db_with_users(users)
+        with patch.object(handler, 'dynamodb', mock_db), \
+             patch('phase2_lambda_function.archive_user') as mock_archive:
+            handler.lambda_handler(_sweep_event(), None)
+        call_kwargs = mock_archive.call_args.kwargs
+        self.assertIn("cognito_client", call_kwargs)
+
     def test_single_failure_counted_as_failed(self):
         mock_db = _db_with_users([{"userId": "user-1"}])
         with patch.object(handler, 'dynamodb', mock_db), \
@@ -165,7 +188,7 @@ class TestEventBridgeSweep(unittest.TestCase):
         users = [{"userId": "user-1"}, {"userId": "user-2"}, {"userId": "user-3"}]
         mock_db = _db_with_users(users)
 
-        def side_effect(uid, *args):
+        def side_effect(uid, *args, **kwargs):
             if uid == "user-2":
                 raise VerificationError("Archive write failed")
 
@@ -208,6 +231,79 @@ class TestEventBridgeSweep(unittest.TestCase):
         scan_kwargs = mock_db.Table.return_value.scan.call_args.kwargs
         self.assertIn("FilterExpression", scan_kwargs)
 
+
+# ── POST /account/restore ──────────────────────────────────────────────────────
+
+class TestRestoreEndpoint(unittest.TestCase):
+
+    def test_happy_path_returns_200(self):
+        with patch('phase2_lambda_function.restore_user'):
+            resp = handler.lambda_handler(_restore_event(), None)
+        self.assertEqual(resp["statusCode"], 200)
+
+    def test_success_response_status_is_restored(self):
+        with patch('phase2_lambda_function.restore_user'):
+            resp = handler.lambda_handler(_restore_event(), None)
+        self.assertEqual(json.loads(resp["body"])["status"], "restored")
+
+    def test_restore_user_called_with_correct_args(self):
+        with patch('phase2_lambda_function.restore_user') as mock_restore:
+            handler.lambda_handler(_restore_event(), None)
+        mock_restore.assert_called_once_with(
+            USER_ID, DELETION_TOKEN,
+            handler.dynamodb, handler.s3_client, handler.cognito_client
+        )
+
+    def test_missing_user_id_returns_400(self):
+        event = {"httpMethod": "POST", "path": "/account/restore",
+                 "body": json.dumps({"deletionToken": DELETION_TOKEN})}
+        resp = handler.lambda_handler(event, None)
+        self.assertEqual(resp["statusCode"], 400)
+
+    def test_missing_deletion_token_returns_400(self):
+        event = {"httpMethod": "POST", "path": "/account/restore",
+                 "body": json.dumps({"userId": USER_ID})}
+        resp = handler.lambda_handler(event, None)
+        self.assertEqual(resp["statusCode"], 400)
+
+    def test_value_error_returns_400(self):
+        with patch('phase2_lambda_function.restore_user',
+                   side_effect=ValueError("Restore window has closed")):
+            resp = handler.lambda_handler(_restore_event(), None)
+        self.assertEqual(resp["statusCode"], 400)
+        self.assertIn("window", json.loads(resp["body"])["error"].lower())
+
+    def test_runtime_error_returns_500(self):
+        with patch('phase2_lambda_function.restore_user',
+                   side_effect=RuntimeError("Failed to re-enable Cognito user")):
+            resp = handler.lambda_handler(_restore_event(), None)
+        self.assertEqual(resp["statusCode"], 500)
+
+    def test_unexpected_error_returns_500(self):
+        with patch('phase2_lambda_function.restore_user',
+                   side_effect=Exception("Unexpected error")):
+            resp = handler.lambda_handler(_restore_event(), None)
+        self.assertEqual(resp["statusCode"], 500)
+
+    def test_response_has_cors_headers(self):
+        with patch('phase2_lambda_function.restore_user'):
+            resp = handler.lambda_handler(_restore_event(), None)
+        self.assertIn("Access-Control-Allow-Origin", resp["headers"])
+
+    def test_null_body_returns_400(self):
+        """body=None (absent from event) must be handled gracefully — not crash."""
+        event = {"httpMethod": "POST", "path": "/account/restore", "body": None}
+        resp = handler.lambda_handler(event, None)
+        self.assertEqual(resp["statusCode"], 400)
+
+    def test_empty_body_string_returns_400(self):
+        """body="" (empty string) must return 400, not 500."""
+        event = {"httpMethod": "POST", "path": "/account/restore", "body": ""}
+        resp = handler.lambda_handler(event, None)
+        self.assertEqual(resp["statusCode"], 400)
+
+
+# ── Edge cases ─────────────────────────────────────────────────────────────────
 
 class TestEdgeCases(unittest.TestCase):
 

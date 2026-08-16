@@ -1,8 +1,8 @@
 # Digilux Honeywell — Account Deletion Feature
-**Version:** 1.0
-**Last updated:** 2025-08-16
-**Owners:** Digilux Platform Team
-**Solution Architect:** Nitin Saxena
+
+**Version:** 2.0
+**Last updated:** 2026-08-16
+**Owner:** Digilux Platform Team
 
 ---
 
@@ -12,13 +12,11 @@
 2. [Architecture](#2-architecture)
 3. [Data Inventory](#3-data-inventory)
 4. [API Reference](#4-api-reference)
-   - 4.1 [Phase 1 — DELETE /account (User-Facing)](#41-phase-1--delete-account-user-facing)
-   - 4.2 [Phase 2 — POST /admin/archive (Admin Force-Archive)](#42-phase-2--post-adminarchive-admin-force-archive)
-   - 4.3 [Complete Error Catalog](#43-complete-error-catalog)
 5. [Integration Guide](#5-integration-guide)
 6. [Audit Trail](#6-audit-trail)
 7. [Monitoring & Alerting](#7-monitoring--alerting)
 8. [Troubleshooting](#8-troubleshooting)
+9. [Deployment Guide (DevOps Handover)](#9-deployment-guide-devops-handover)
 
 ---
 
@@ -26,33 +24,30 @@
 
 ### What it does
 
-The Account Deletion feature allows a Digilux Honeywell user to permanently delete their account and all associated data. It is designed with two core principles:
+A Digilux Honeywell user can permanently delete their account and all associated data. The system:
 
-- **Immediate revocation** — the user loses access the moment they confirm deletion. No grace period for re-entry.
-- **Safe async cleanup** — actual data deletion happens out-of-band after an archive-first, verify-then-delete pipeline. Source data is never deleted without a confirmed backup.
+- Revokes access **immediately** the moment the user confirms deletion
+- Gives a **7-day restore window** — the user can cancel and get everything back
+- Returns a **deletion token** the user can use to track or dispute the deletion
+- Archives all data to S3 **before** deleting any source record — hard-delete never runs without a verified archive
+- Permanently removes all data after the 7-day window closes
 
 ### Why two phases?
 
-A synchronous, single-request deletion (delete everything right now) carries unacceptable risk:
+Deleting everything in one synchronous request is unsafe — a timeout or partial failure can leave data in an unrecoverable state. The two-phase design separates the instant user-facing action from the heavier async cleanup.
 
-| Risk | Consequence |
-|---|---|
-| Lambda timeout mid-delete | Partial deletion with no record of what was removed |
-| S3 archive fails silently | Source data deleted with no backup |
-| DynamoDB throttle on one table | Other tables not cleaned up |
-
-The two-phase design eliminates all of these:
-
-- **Phase 1** completes in milliseconds (user-facing, returns immediately)
-- **Phase 2** runs async, retries at the table level, and is gated by a hard archive verification step
+| Phase | When | What happens |
+|---|---|---|
+| Phase 1 | Immediately, on user request | Sessions revoked, account disabled, devices unbound |
+| Phase 2 | After 7-day window (auto via EventBridge or admin-triggered) | Archive to S3 → verify → hard-delete all data + Cognito user |
 
 ### Key guarantees
 
-1. A user can never log in after Phase 1 completes (Cognito user deleted, all sessions revoked).
-2. All user data is archived to S3 before any source row is deleted.
-3. If the S3 archive cannot be verified, hard-delete is **aborted** — data is preserved and an alert is raised.
-4. Every step (success and failure) is recorded in a DynamoDB audit table and in structured CloudWatch log lines.
-5. The pipeline is idempotent — calling Phase 1 on an already-INACTIVE user returns 200 without re-processing.
+1. User **cannot log in** the moment Phase 1 completes (all sessions invalidated, Cognito account disabled).
+2. User has **7 days to restore** their account using the deletion token.
+3. **All data is archived to S3** before any source row is deleted. Verification is a hard gate — if it fails, hard-delete is aborted.
+4. The **deletion token** returned at Phase 1 proves when and from where the request was made — useful for disputes.
+5. Every step is recorded in DynamoDB and CloudWatch with structured JSON — queryable per user.
 
 ---
 
@@ -61,71 +56,91 @@ The two-phase design eliminates all of these:
 ### High-level flow
 
 ```
-User App                  API Gateway              Lambda                 AWS Services
-─────────                 ───────────              ──────                 ────────────
-  │                            │                      │                        │
-  │── DELETE /account ────────>│                      │                        │
-  │   Bearer: <user JWT>       │── invoke ──────────>│                        │
-  │                            │                      │── sign-out ───────────>│ Cognito
-  │                            │                      │── mark INACTIVE ──────>│ DynamoDB (user_data)
-  │                            │                      │── release devices ────>│ DynamoDB (device_data)
-  │                            │                      │── delete Cognito user >│ Cognito
-  │                            │                      │── write audit log ────>│ DynamoDB (deletion_audit)
-  │<── 200 "processing" ───────│<── response ─────────│                        │
-  │                            │                      │                        │
-  │  (user cannot log in again from this point)       │                        │
-  │                            │                      │                        │
-  :  [ next day, 02:00 UTC ]   :                      :                        :
-  :                            :                      :                        :
-  :                        EventBridge ── invoke ────>│ (or admin POST)        :
-  :                            :                      │── resolve all data ────>│ DynamoDB (14 tables)
-  :                            :                      │── archive to S3 ───────>│ S3 (archive bucket)
-  :                            :                      │── verify archive ───────>│ S3 head_object x14
-  :                            :                      │── hard-delete source ──>│ DynamoDB + S3
-  :                            :                      │── update audit log ────>│ DynamoDB (deletion_audit)
+User App               API Gateway          Lambda                AWS Services
+--------               -----------          ------                ------------
+|                           |                   |                      |
+|-- DELETE /account ------->|-- invoke --------->|-- revoke sessions -->| Cognito
+|                           |                   |-- disable account -->| Cognito
+|                           |                   |-- unbind devices --->| DynamoDB
+|                           |                   |-- write evidence --->| DynamoDB
+|<-- 200 {deletionToken} ---|<-- response --------|                      |
+|                           |                   |                      |
+|  [within 7 days - user can restore]           |                      |
+|-- POST /account/restore -->|-- invoke --------->|-- re-enable login -->| Cognito
+|                           |                   |-- restore tables --->| DynamoDB
+|<-- 200 "restored" --------|<-- response --------|                      |
+|                           |                   |                      |
+|  [after 7 days - EventBridge daily at 02:00 UTC, or admin POST]      |
+|                     EventBridge -- invoke --->|-- 7-day gate check  |
+|                           |                   |-- read 15 tables --->| DynamoDB
+|                           |                   |-- scan S3 endpoints->| S3 (metadata)
+|                           |                   |-- archive to S3 ---->| S3 (archive)
+|                           |                   |-- verify archive --->| S3
+|                           |                   |-- hard-delete ------>| DynamoDB + S3
+|                           |                   |-- delete Cognito --->| Cognito
+|                           |                   |-- update audit ----->| DynamoDB
 ```
 
-### Phase 1 — Immediate revocation (user-facing)
-
-Triggered by the user. Must complete within the Lambda timeout (29 s API Gateway limit).
+### Phase 1 steps (user-facing, must complete within 29 s)
 
 ```
-Step 1  Decode JWT          → extract sub claim as userId
-Step 2  Idempotency check   → if status=INACTIVE, return 200 early (safe to re-call)
-Step 3  Global sign-out     → admin_user_global_sign_out — all sessions revoked NOW
-Step 4  Mark INACTIVE       → user_data: status=INACTIVE, archivePending=true  ← CRITICAL
-Step 5  Release devices     → device_data: userId="0" (device unowned, not deleted)
-Step 6  Delete Cognito user → admin_delete_user — login impossible forever
-Step 7  Write audit log     → deletion_audit: PHASE1_COMPLETE + per-step outcomes
+Step 1   Decode JWT               Extract sub claim -> userId
+Step 2   Idempotency check        Already INACTIVE? Return 200 early - safe to re-call
+Step 3   Global sign-out          admin_user_global_sign_out - all sessions revoked now
+Step 4   Mark INACTIVE            user_data: status=INACTIVE, archivePending=true  <- only fatal step
+Step 5   Unbind devices           device_data: userId="0" for all owned devices
+Step 6   Disable Cognito          admin_disable_user - login blocked, user still exists for restore
+Step 7   Write deletion evidence  deletion_evidence: userId, emailEncrypted, ipAddress, deletionToken
+Step 8   Write audit log          deletion_audit: PHASE1_COMPLETE + all step outcomes
+         Return 200               { status, deletionToken }
 ```
 
-> **Step 4 is the only fatal step.** If it fails, the Lambda returns 500 and nothing else proceeds. All other step failures are logged and non-fatal — the pipeline continues.
+> Step 4 is the only fatal step. If it fails, Lambda returns 500 and nothing else runs. All other step failures are logged as non-fatal and the pipeline continues.
 
-### Phase 2 — Async archive and hard-delete
-
-Triggered by EventBridge (daily at 02:00 UTC) OR by an admin POST call. Scans for all users with `status=INACTIVE AND archivePending=true`.
+### Phase 2 steps (async, triggered by EventBridge daily at 02:00 UTC)
 
 ```
-Step 1  Guard check         → confirm user is INACTIVE + archivePending=true
-Step 2  Resolve             → collect every row from 14 DynamoDB tables + all S3 keys
-Step 3  Archive             → write 14 JSON files to s3://digilux-honeywell-archive/archive/{userId}/dynamodb/
-                             copy S3 metadata objects to s3://digilux-honeywell-archive/archive/{userId}/metadata/
-Step 4  Verify              → head_object every archive file; abort if missing or empty  ← SAFETY GATE
-Step 5  Hard-delete         → cascade tables first, then direct-userId tables, then S3
-                             clear archivePending=false in user_data
-                             update deletion_audit: PHASE2_COMPLETE / PHASE2_PARTIAL
+Step 1   Guard check              Confirm status=INACTIVE + archivePending=true
+Step 2   7-day gate               Reject if now - deletionRequestedAt < 7 days
+Step 3   Resolve                  Collect all rows from 15 DynamoDB tables + user S3 keys
+Step 4   Scan S3 endpoints        List all endpoints.json under {userId}/ in metadata bucket
+                                  Skip deviceType=11 (gateway - keep in system)
+                                  Collect unique subdeviceMacAddress values from remaining entries
+                                  Query device_data via macAddress-index GSI -> rows to delete
+Step 5   Archive                  Write 15 JSON files to archive/{userId}/dynamodb/
+                                  Copy S3 metadata objects to archive/{userId}/metadata/
+Step 6   Verify                   head_object every archive file - abort if missing or empty  <- hard gate
+Step 7   Hard-delete              Delete all resolved DynamoDB rows
+                                  Delete subdevice rows from device_data
+                                  Delete source S3 metadata objects
+                                  Set user_data.archivePending=false
+Step 8   Delete Cognito user      admin_delete_user - permanent, login impossible forever
+Step 9   Update audit log         deletion_audit: PHASE2_COMPLETE / PHASE2_PARTIAL
+         Update evidence          deletion_evidence: archiveDeletedAt = now
 ```
 
-> **Step 4 (Verify) is a hard gate.** `VerificationError` aborts the pipeline. Source data is never touched if the archive cannot be confirmed.
+> Step 6 is a hard gate. If verification fails, steps 7-9 do not run. Source data is preserved and an alert fires.
+
+### Restore flow (within 7-day window only)
+
+```
+Step 1   Validate token        Look up deletion_evidence by deletionToken
+Step 2   Check window          Reject if now - requestedAt > 7 days
+Step 3   Re-enable Cognito     admin_enable_user - login re-allowed
+Step 4   Restore DynamoDB      Read 15 JSON archives from S3, PUT rows back to source tables
+Step 5   Re-bind devices       device_data: set userId back from "0" to original userId
+Step 6   Clear flags           user_data: status=ACTIVE, archivePending=false
+Step 7   Update records        deletion_evidence: restoredAt=now; deletion_audit: RESTORED
+         Return 200            { message: "Account restored" }
+```
 
 ### EventBridge schedule
 
-| Field | Value |
+| Setting | Value |
 |---|---|
-| Schedule expression | `cron(0 2 * * ? *)` |
-| Runs | Every day at 02:00 UTC |
-| Target | Phase 2 Lambda (`phase2_archive_worker`) |
-| Event payload | `{ "source": "aws.scheduler" }` |
+| Schedule | `cron(0 2 * * ? *)` - every day at 02:00 UTC |
+| Target | Phase 2 Lambda |
+| Retry | Max 2 attempts |
 
 ---
 
@@ -133,66 +148,89 @@ Step 5  Hard-delete         → cascade tables first, then direct-userId tables,
 
 ### DynamoDB tables
 
-| Table | What is stored | Deletion method |
+| Table | What is stored | Action on deletion |
 |---|---|---|
-| `digilux_honeywell_user_data` | User profile, status, preferences | `status` set to `INACTIVE`; `archivePending` cleared after Phase 2 |
-| `digilux_honeywell_device_data` | Device registry per user | `userId` set to `"0"` in Phase 1 (unowned); rows deleted in Phase 2 |
-| `digilux_honeywell_scene_data` | Scenes created by the user | Deleted in Phase 2 |
-| `digilux_honeywell_user_device_details` | User-site-device binding details | Deleted in Phase 2 |
-| `digilux_honeywell_user_device_mapping` | User-site device mapping | Deleted in Phase 2 |
-| `digilux_honeywell_user_subuser_detail` | Sub-user relationships | Deleted in Phase 2 |
-| `digilux_honeywell_user_subuser_mapping` | Sub-user invite/request records | Deleted in Phase 2 |
-| `digilux_honeywell_subuser_role_data` | Role assignments for sub-users | Deleted in Phase 2 |
-| `digilux_honeywell_admin_otp_data` | OTP records per module category | Deleted in Phase 2 |
-| `digilux_honeywell_alexa_lwa_tokens` | Alexa LWA refresh tokens | Deleted in Phase 2 |
-| `digilux_honeywell_device_state` | Last known state of each device | Deleted in Phase 2 |
-| `digilux_honeywell_entity_state` | Endpoint-level entity state | Deleted in Phase 2 |
-| `digilux_honeywell_automation_event` | Automation event definitions | Deleted in Phase 2 |
-| `digilux_honeywell_automation_schedule_direct` | Direct automation schedules | Deleted in Phase 2 |
-| `digilux_honeywell_automation_schedule_controller` | Controller automation schedules | Deleted in Phase 2 |
-| `digilux_honeywell_deletion_audit` | Audit log — one record per user deletion | Written in Phase 1; updated in Phase 2 — **never deleted** |
+| `digilux_honeywell_user_data` | User profile, status, preferences | Phase 1: marked INACTIVE. Phase 2: archivePending cleared. Never deleted. |
+| `digilux_honeywell_device_data` | Device registry | Phase 1: userId set to "0" (unbound). Phase 2: gateway rows kept; subdevice rows (deviceType=12) hard-deleted via S3 endpoint scan. |
+| `digilux_honeywell_scene_data` | Scenes created by user | Archive + hard-delete in Phase 2 |
+| `digilux_honeywell_user_device_details` | User-site-device binding details | Archive + hard-delete in Phase 2 |
+| `digilux_honeywell_user_device_mapping` | User-site device mapping | Archive + hard-delete in Phase 2 |
+| `digilux_honeywell_user_subuser_detail` | Sub-user relationships | Archive + hard-delete in Phase 2 |
+| `digilux_honeywell_user_subuser_mapping` | Sub-user invite records | Archive + hard-delete in Phase 2 |
+| `digilux_honeywell_subuser_role_data` | Role assignments for sub-users | Archive + hard-delete in Phase 2 |
+| `digilux_honeywell_admin_otp_data` | OTP records | Archive + hard-delete in Phase 2 |
+| `digilux_honeywell_alexa_lwa_tokens` | Alexa LWA refresh tokens | Archive + hard-delete in Phase 2 |
+| `digilux_honeywell_device_state` | Last known device state | Archive + hard-delete in Phase 2 |
+| `digilux_honeywell_entity_state` | Endpoint-level entity state | Archive + hard-delete in Phase 2 |
+| `digilux_honeywell_automation_event` | Automation event definitions | Archive + hard-delete in Phase 2 |
+| `digilux_honeywell_automation_schedule_direct` | Direct device automation schedules | Archive + hard-delete in Phase 2 |
+| `digilux_honeywell_automation_schedule_controller` | Network controller automation schedules | Archive + hard-delete in Phase 2 |
+| `digilux_honeywell_deletion_audit` | Pipeline audit log - one record per user deletion | Written Phase 1, updated Phase 2. **Never deleted.** |
+| `digilux_honeywell_deletion_evidence` | Compliance record - encrypted email, IP, token, timestamps | Written Phase 1. **Never deleted.** |
+
+### device_data: gateway vs subdevice
+
+The same table holds two types of rows, handled differently:
+
+| Row type | deviceType | Treatment |
+|---|---|---|
+| Gateway / WiFiBridge | `11` | Unbind only (userId -> "0"). Hardware stays in the system. |
+| Zigbee subdevice (lights, drivers, sensors) | `12` | Hard-deleted in Phase 2 via S3 endpoint scan. |
+
+**How Phase 2 discovers subdevice rows:**
+
+```
+S3 path scanned:
+  s3://{metadata_bucket}/{userId}/site_{siteId}/devices/{deviceId}/{gatewayMac}/{subdeviceMac}/endpoints.json
+
+For each file found:
+  1. Parse the JSON array of endpoint objects
+  2. Skip entries where deviceType == 11 (gateway)
+  3. Collect unique subdeviceMacAddress values from remaining entries
+  4. Query device_data using macAddress-index GSI for each MAC
+  5. Hard-delete matched rows by (deviceId, macAddress)
+```
 
 ### S3 buckets
 
 | Bucket | Role |
 |---|---|
-| `digilux-honeywell-metadata` | Source — user's live metadata files (JSON per device/scene/site) |
-| `digilux-honeywell-archive` | Destination — archived DynamoDB JSON + copied S3 metadata |
+| `digilux-honeywell-metadata` | Live user metadata - endpoint files, scene files, zone files |
+| `digilux-honeywell-archive` | Deletion archive - DynamoDB JSON exports + copied metadata |
 
-### Archive layout in S3
+**Archive layout:**
 
 ```
-s3://digilux-honeywell-archive/
-└── archive/
-    └── {userId}/
-        ├── dynamodb/
-        │   ├── device_data.json
-        │   ├── scene_data.json
-        │   ├── user_device_details.json
-        │   ├── user_device_mapping.json
-        │   ├── user_subuser_detail.json
-        │   ├── user_subuser_mapping.json
-        │   ├── subuser_role_data.json
-        │   ├── admin_otp_data.json
-        │   ├── alexa_lwa_tokens.json
-        │   ├── device_state.json
-        │   ├── entity_state.json
-        │   ├── automation_event.json
-        │   ├── automation_schedule_direct.json
-        │   └── automation_schedule_ctrl.json
-        └── metadata/
-            └── {userId}/
-                └── ... (copied from digilux-honeywell-metadata)
+s3://digilux-honeywell-archive/archive/{userId}/
++-- dynamodb/
+|   +-- scene_data.json
+|   +-- device_data.json
+|   +-- user_device_details.json
+|   +-- user_device_mapping.json
+|   +-- user_subuser_detail.json
+|   +-- user_subuser_mapping.json
+|   +-- subuser_role_data.json
+|   +-- admin_otp_data.json
+|   +-- alexa_lwa_tokens.json
+|   +-- device_state.json
+|   +-- entity_state.json
+|   +-- automation_event.json
+|   +-- automation_schedule_direct.json
+|   +-- automation_schedule_controller.json
+|   +-- automation_schedule_ctrl.json
++-- metadata/
+    +-- {userId}/  (copied from digilux-honeywell-metadata)
 ```
 
-### Cognito User Pool
+### Cognito
 
-| Field | Value |
+| Setting | Value |
 |---|---|
 | User Pool ID | `ap-south-1_KJpJMEzyM` |
-| Region | `ap-south-1` |
-| userId field | `sub` claim from the AccessToken JWT |
-| Phase 1 actions | `admin_user_global_sign_out` then `admin_delete_user` |
+| userId | `sub` claim from the Cognito AccessToken |
+| Phase 1 | `admin_user_global_sign_out` then `admin_disable_user` |
+| Phase 2 | `admin_delete_user` (after archive verified, after 7-day window) |
+| Restore | `admin_enable_user` (within 7-day window only) |
 
 ---
 
@@ -204,704 +242,396 @@ s3://digilux-honeywell-archive/
 https://{api_id}.execute-api.ap-south-1.amazonaws.com/{stage}
 ```
 
-Replace `{api_id}` with your API Gateway ID and `{stage}` with `prod`, `dev`, or `staging`.
-
 ### Authentication
 
-Both endpoints use JWT Bearer tokens. The token is a Cognito **AccessToken**.
+All endpoints use Cognito AccessToken JWTs as Bearer tokens. The `sub` claim is the `userId`.
 
 ```
 Authorization: Bearer <AccessToken>
 ```
 
-The Lambda decodes the token locally (no Cognito API call) and extracts the `sub` claim as `userId`. **The token is not validated cryptographically inside the Lambda** — API Gateway's Cognito Authorizer must be configured to verify signatures before the request reaches the Lambda.
-
 ---
 
-### 4.1 Phase 1 — DELETE /account (User-Facing)
+### 4.1 DELETE /account - Initiate Deletion (Phase 1)
 
-Initiates account deletion for the authenticated user. Returns immediately — actual data removal happens async in Phase 2.
+Initiates account deletion for the authenticated user. Returns immediately. Data is not removed yet.
 
-#### Endpoint
+**Request**
 
 ```
 DELETE /account
+Authorization: Bearer <AccessToken>
 ```
 
-#### Headers
+No request body.
 
-| Header | Required | Value |
-|---|---|---|
-| `Authorization` | Yes | `Bearer <Cognito AccessToken>` |
-
-#### Request body
-
-None.
-
-#### Responses
-
----
-
-**200 OK — Deletion initiated**
-
-The 7-step Phase 1 pipeline completed successfully. The user's Cognito account is deleted — they cannot log in again. Data will be cleaned up within 7 business days via Phase 2.
+**200 OK - Success**
 
 ```json
 {
     "message": "Your account deletion request has been received. Your access has been revoked immediately. All associated data will be permanently removed within 7 business days.",
-    "status": "processing"
+    "status": "processing",
+    "deletionToken": "f47ac10b-58cc-4372-a567-0e02b2c3d479"
 }
 ```
 
----
+Save `deletionToken` - the user needs it to check status or request a restore within 7 days.
 
-**200 OK — Already processed (idempotent)**
-
-Phase 1 was already completed for this user (their record shows `status=INACTIVE`). Safe to call multiple times — returns the same acknowledgement without re-processing.
+**200 OK - Already processed (idempotent)**
 
 ```json
 {
-    "message": "Your account deletion request has been received. Your access has been revoked immediately. All associated data will be permanently removed within 7 business days.",
+    "message": "...",
     "status": "already_processed"
 }
 ```
 
+**401 Unauthorized** - Token missing, malformed, or no `sub` claim.
+
+**500 Internal Server Error** - Mark-INACTIVE DynamoDB step failed. Safe to retry.
+
 ---
 
-**401 Unauthorized — No token**
+### 4.2 POST /account/restore - Restore Account
 
-`Authorization` header is missing or empty.
+Cancels a pending deletion and fully restores the account. Only valid within 7 days of Phase 1.
+
+**Request**
+
+```
+POST /account/restore
+Content-Type: application/json
+```
 
 ```json
 {
-    "message": "Unauthorized",
-    "error": "Authorization token missing"
+    "token": "f47ac10b-58cc-4372-a567-0e02b2c3d479"
 }
 ```
 
----
-
-**401 Unauthorized — Malformed JWT**
-
-The token does not have 3 dot-separated segments.
+**200 OK - Restored**
 
 ```json
 {
-    "message": "Unauthorized",
-    "error": "Invalid JWT format"
+    "message": "Your account has been restored. You can log in again.",
+    "userId": "cognito-sub-uuid-abc-123",
+    "restoredAt": "2026-08-20T10:30:00.000000+00:00"
 }
+```
+
+**400 Bad Request** - Token not found, or 7-day window has expired.
+
+```json
+{ "error": "Restore window has expired. Data was permanently deleted on 2026-08-23T02:14:37+00:00." }
+```
+
+```json
+{ "error": "Invalid or unknown deletion token." }
+```
+
+**409 Conflict** - Account was already restored.
+
+```json
+{ "error": "Account already restored." }
 ```
 
 ---
 
-**401 Unauthorized — Missing sub claim**
+### 4.3 GET /account/deletion-status - Check Deletion Timeline
 
-The token is structurally valid but the payload does not contain a `sub` claim.
+Returns the full deletion timeline for a given token. No Bearer token required - the deletion token is the credential. Used when a user claims they did not initiate the deletion.
+
+**Request**
+
+```
+GET /account/deletion-status?token=f47ac10b-58cc-4372-a567-0e02b2c3d479
+```
+
+**200 OK**
 
 ```json
 {
-    "message": "Unauthorized",
-    "error": "Missing 'sub' in token claims"
+    "userId": "cognito-sub-uuid-abc-123",
+    "requestedAt": "2026-08-16T02:14:37+00:00",
+    "ipAddress": "203.0.113.42",
+    "userAgent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 ...)",
+    "archiveStartedAt": "2026-08-23T02:00:04+00:00",
+    "archiveCompletedAt": "2026-08-23T02:00:09+00:00",
+    "archiveDeletedAt": null,
+    "restoredAt": null,
+    "status": "PHASE2_COMPLETE"
 }
 ```
 
----
-
-**500 Internal Server Error — Mark INACTIVE failed**
-
-DynamoDB `update_item` failed when trying to set `status=INACTIVE`. This is the only fatal failure in Phase 1 — all other step failures are non-fatal and logged but do not abort the pipeline.
-
-```json
-{
-    "message": "Failed to process deletion request. Please try again."
-}
-```
-
----
-
-#### Response headers (all responses)
-
-```
-Access-Control-Allow-Origin:  *
-Access-Control-Allow-Methods: DELETE,OPTIONS
-Content-Type:                 application/json
-```
-
-#### Example — cURL
-
-```bash
-curl -X DELETE \
-  "https://{api_id}.execute-api.ap-south-1.amazonaws.com/prod/account" \
-  -H "Authorization: Bearer eyJraWQiOiJleGFtcGxlIiwidHlwIjoiSldUIn0.eyJzdWIiOiJ1c2VyLXV1aWQtMTIzIn0.signature"
-```
-
-#### Status code summary
-
-| Status | Meaning |
+| `status` | Meaning |
 |---|---|
-| `200` + `status: processing` | Success — pipeline complete |
-| `200` + `status: already_processed` | Idempotent — already done |
-| `401` | Auth failure — token missing, malformed, or no sub claim |
-| `500` | Server error — only when mark-INACTIVE DynamoDB write fails |
+| `PHASE1_COMPLETE` | Deletion requested, restore still possible |
+| `PHASE2_COMPLETE` | All data permanently deleted |
+| `RESTORED` | Account was restored within the 7-day window |
+
+**400 Bad Request** - Token missing or not found.
+
+```json
+{ "error": "Invalid or unknown deletion token." }
+```
 
 ---
 
-### 4.2 Phase 2 — POST /admin/archive (Admin Force-Archive)
+### 4.4 POST /admin/archive - Force Archive (Admin Only)
 
-Archives and hard-deletes all data for a specific `userId`. Used by administrators to immediately process a user who is already INACTIVE, without waiting for the next EventBridge sweep (02:00 UTC).
+Immediately runs Phase 2 for a specific user. Bypasses the daily EventBridge sweep. The 7-day grace period is still enforced.
 
-> **This endpoint must be protected by an admin authorizer on API Gateway.** Regular users must not be able to call it.
-
-#### Endpoint
+**Request**
 
 ```
 POST /admin/archive
+Authorization: Bearer <admin_token>
+Content-Type: application/json
 ```
-
-#### Headers
-
-| Header | Required | Value |
-|---|---|---|
-| `Authorization` | Yes | `Bearer <Admin JWT>` |
-| `Content-Type` | Yes | `application/json` |
-
-#### Request body
 
 ```json
-{
-    "userId": "cognito-sub-uuid-abc-123"
-}
+{ "userId": "cognito-sub-uuid-abc-123" }
 ```
 
-| Field | Type | Required | Description |
+**Prerequisite:** User must already have `status=INACTIVE` and `archivePending=true` (set by Phase 1).
+
+**200 OK**
+
+```json
+{ "message": "Archive complete for userId=cognito-sub-uuid-abc-123" }
+```
+
+**400 Bad Request** - userId missing, user not eligible, or 7-day window still open.
+
+```json
+{ "error": "Restore window still open. Phase 2 not permitted until 2026-08-23T02:14:37+00:00." }
+```
+
+**500 Internal Server Error - Verification failed (data safe)**
+
+```json
+{ "error": "Archive verification failed - hard-delete aborted. Archive file missing: archive/.../dynamodb/scene_data.json" }
+```
+
+Source data is untouched. Investigate S3 before retrying.
+
+---
+
+### 4.5 Error Catalog
+
+| Status | Error | Cause | Action |
 |---|---|---|---|
-| `userId` | string | Yes | The `sub` claim value (UUID) of the user to archive. Must not be empty or whitespace-only. |
-
-#### Prerequisite
-
-Before calling this endpoint, the user **must** already be in state:
-- `status = INACTIVE` in `digilux_honeywell_user_data`
-- `archivePending = true` in `digilux_honeywell_user_data`
-
-Both conditions are set by Phase 1. If they are not set, the endpoint returns 400.
-
-#### Responses
-
----
-
-**200 OK — Archive complete**
-
-All 5 steps of Phase 2 completed successfully. All source data has been deleted.
-
-```json
-{
-    "message": "Archive complete for userId=cognito-sub-uuid-abc-123"
-}
-```
-
----
-
-**400 Bad Request — userId missing**
-
-`userId` key is absent from the request body, or its value is an empty / whitespace-only string.
-
-```json
-{
-    "error": "userId is required"
-}
-```
-
----
-
-**400 Bad Request — userId not found or not eligible**
-
-The `userId` does not exist in `user_data`, or the user is not `INACTIVE`, or `archivePending` is not `true`. These are all mapped to `ValueError` inside the archiver.
-
-```json
-{
-    "error": "userId=cognito-sub-uuid-abc-123 not found in user_data"
-}
-```
-
-```json
-{
-    "error": "userId=cognito-sub-uuid-abc-123 is not INACTIVE (status='ACTIVE')"
-}
-```
-
-```json
-{
-    "error": "userId=cognito-sub-uuid-abc-123 archivePending is not True — already processed?"
-}
-```
-
----
-
-**500 Internal Server Error — Archive verification failed**
-
-The archive was written to S3 but `head_object` verification failed (file missing or empty). **Hard-delete was NOT performed.** Source data is preserved. Investigate the archive bucket before retrying.
-
-```json
-{
-    "error": "Archive verification failed — hard-delete aborted. Archive file missing: archive/cognito-sub-uuid-abc-123/dynamodb/device_data.json"
-}
-```
-
----
-
-**500 Internal Server Error — Unexpected error**
-
-An unhandled exception occurred. Check CloudWatch logs for the full traceback.
-
-```json
-{
-    "error": "An unexpected error description"
-}
-```
-
----
-
-#### Response headers (all responses)
-
-```
-Access-Control-Allow-Origin:  *
-Access-Control-Allow-Methods: POST,OPTIONS
-Content-Type:                 application/json
-```
-
-#### Example — cURL
-
-```bash
-curl -X POST \
-  "https://{api_id}.execute-api.ap-south-1.amazonaws.com/prod/admin/archive" \
-  -H "Authorization: Bearer <admin_token>" \
-  -H "Content-Type: application/json" \
-  -d '{"userId": "cognito-sub-uuid-abc-123"}'
-```
-
-#### Status code summary
-
-| Status | Meaning |
-|---|---|
-| `200` | Success — archive + hard-delete complete |
-| `400` | Bad input — missing userId, or user not eligible |
-| `500` | Server error — verification failed (data safe) or unexpected exception |
-
----
-
-### 4.3 Complete Error Catalog
-
-| HTTP Status | `error` / `message` value | Root cause | Safe to retry? |
-|---|---|---|---|
-| `401` | `Authorization token missing` | No `Authorization` header or empty Bearer value | Fix the request |
-| `401` | `Invalid JWT format` | Token has fewer or more than 3 dot-separated segments | Fix the token |
-| `401` | `Missing 'sub' in token claims` | Token payload does not contain `sub` claim | Fix the token |
-| `400` | `userId is required` | Phase 2: `userId` absent or whitespace | Fix the request |
-| `400` | `userId=... not found in user_data` | userId doesn't exist or Phase 1 never ran | Check userId / run Phase 1 first |
-| `400` | `userId=... is not INACTIVE` | User's `status` is not `INACTIVE` | Run Phase 1 first |
-| `400` | `archivePending is not True` | Phase 2 already completed for this user | No action needed |
-| `500` | `Failed to process deletion request. Please try again.` | Phase 1: DynamoDB `update_item` failed (mark-INACTIVE step) | Retry Phase 1 |
-| `500` | `Archive verification failed — hard-delete aborted.` | S3 archive file missing/empty after write | Investigate S3 + retry Phase 2 |
-| `500` | *(any other message)* | Unexpected exception | Check CloudWatch logs |
+| `401` | `Authorization token missing` | No Authorization header | Fix request |
+| `401` | `Invalid JWT format` | Token not 3 dot-separated parts | Fix token |
+| `401` | `Missing 'sub' in token claims` | No sub claim in payload | Fix token |
+| `400` | `userId is required` | Admin endpoint: userId empty | Fix request |
+| `400` | `userId=... not found` | User doesn't exist or Phase 1 never ran | Run Phase 1 first |
+| `400` | `userId=... is not INACTIVE` | User still active | Run Phase 1 first |
+| `400` | `archivePending is not True` | Phase 2 already ran | No action needed |
+| `400` | `Restore window still open` | Admin called Phase 2 within 7 days | Wait for window to close |
+| `400` | `Restore window has expired` | >7 days since Phase 1 | Cannot restore |
+| `400` | `Invalid or unknown deletion token` | Wrong token | Check the token |
+| `409` | `Account already restored` | Restore already ran | No action needed |
+| `500` | `Failed to process deletion request` | Phase 1 mark-INACTIVE failed | Retry Phase 1 |
+| `500` | `Archive verification failed - hard-delete aborted` | S3 write/verify mismatch | Check S3, retry |
+| `500` | *(other)* | Unexpected exception | Check CloudWatch logs |
 
 ---
 
 ## 5. Integration Guide
 
-This section is for the **consuming team** integrating the Account Deletion feature into a client application (mobile, web, or backend service).
+This section is for the **consuming team** building the deletion flow into a mobile or web app.
 
-### Prerequisites
-
-Before integration, confirm the following with the Digilux Platform Team:
-
-- [ ] Your API Gateway endpoint URL (`api_id` + `stage`)
-- [ ] Your Cognito App Client ID (`cognito_client_id`)
-- [ ] Cognito User Pool ID (`ap-south-1_KJpJMEzyM`)
-- [ ] Admin JWT or API key for the Phase 2 force-archive endpoint (if your service needs it)
-- [ ] Your app's IAM or API Gateway authorizer is configured (if calling the admin endpoint)
-
----
-
-### Sequential call order
-
-The following is the **only correct call sequence**. Do not deviate from this order.
+### Call sequence
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│  STEP 1 — Authenticate the user (your existing auth flow)           │
-│                                                                     │
-│  POST https://cognito-idp.ap-south-1.amazonaws.com/                │
-│  Target: AWSCognitoIdentityProviderService.InitiateAuth             │
-│  Body: { AuthFlow, ClientId, AuthParameters: { USERNAME, PASSWORD }}│
-│                                                                     │
-│  Save: AuthenticationResult.AccessToken → use as Bearer token       │
-└─────────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│  STEP 2 — Present deletion confirmation screen to the user          │
-│                                                                     │
-│  Show the user a clear warning:                                     │
-│  "This is permanent. Your account and all data will be deleted.     │
-│   You will be signed out immediately."                              │
-│                                                                     │
-│  Require explicit confirmation (e.g., type "DELETE" or tap button). │
-└─────────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│  STEP 3 — Call Phase 1 (DELETE /account)                            │
-│                                                                     │
-│  DELETE /account                                                    │
-│  Authorization: Bearer <AccessToken from Step 1>                    │
-│                                                                     │
-│  Expected response: 200 { status: "processing" }                   │
-└─────────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│  STEP 4 — Handle the response in your app                           │
-│                                                                     │
-│  On 200:                                                            │
-│    • Clear all local session data (tokens, cache, user preferences) │
-│    • Navigate to a "Your account has been deleted" screen           │
-│    • Do NOT attempt to refresh the token or call any other API      │
-│                                                                     │
-│  On 401:                                                            │
-│    • Token has expired or is invalid                                │
-│    • Re-authenticate (Step 1) and retry Step 3 once                 │
-│                                                                     │
-│  On 500:                                                            │
-│    • Show a generic error: "Unable to process your request.         │
-│      Please try again."                                             │
-│    • Retry is safe — Phase 1 is idempotent                         │
-└─────────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│  STEP 5 — Data is cleaned up automatically (no action needed)       │
-│                                                                     │
-│  EventBridge runs at 02:00 UTC daily.                               │
-│  Phase 2 picks up this user on the next sweep and permanently       │
-│  removes all data within 24 hours.                                  │
-│                                                                     │
-│  (Admin teams can force-archive immediately — see Section 5.3)      │
-└─────────────────────────────────────────────────────────────────────┘
+1.  Authenticate        ->  obtain Cognito AccessToken
+2.  Confirm with user   ->  explicit user action ("Delete my account")
+3.  DELETE /account     ->  save deletionToken from response
+4.  Clear local state   ->  tokens, cache, session -> redirect to post-deletion screen
+5.  (Optional, <=7 days)->  POST /account/restore with token to cancel deletion
+6.  (Background)        ->  Phase 2 auto-runs after 7 days via EventBridge
 ```
 
----
-
-### 5.1 Step-by-step: Obtaining a Cognito AccessToken
-
-If you are integrating from a backend service (not a mobile app), use the `InitiateAuth` API directly:
-
-**Request:**
-
-```bash
-curl -X POST "https://cognito-idp.ap-south-1.amazonaws.com/" \
-  -H "X-Amz-Target: AWSCognitoIdentityProviderService.InitiateAuth" \
-  -H "Content-Type: application/x-amz-json-1.1" \
-  -d '{
-    "AuthFlow": "USER_PASSWORD_AUTH",
-    "ClientId": "YOUR_COGNITO_CLIENT_ID",
-    "AuthParameters": {
-      "USERNAME": "user@example.com",
-      "PASSWORD": "UserPassword123!"
-    }
-  }'
-```
-
-**Response:**
-
-```json
-{
-    "AuthenticationResult": {
-        "AccessToken": "eyJraWQiOiJleGFtcGxlIiwidHlwIjoiSldUIn0...",
-        "ExpiresIn": 3600,
-        "TokenType": "Bearer",
-        "RefreshToken": "eyJjdHkiOiJKV1QiLCJlbmMiOiJBMjU2R0NNIiwiYWxnIjoiUlNBLU9BRVAifQ...",
-        "IdToken": "eyJraWQiOiJleGFtcGxlIiwidHlwIjoiSldUIn0..."
-    },
-    "ChallengeParameters": {}
-}
-```
-
-Use `AuthenticationResult.AccessToken` as the Bearer token for `DELETE /account`.
-
-> **Token expiry:** AccessTokens expire after 3600 seconds (1 hour). If you receive a 401 on Phase 1, your token may have expired. Re-authenticate and retry.
-
----
-
-### 5.2 Step-by-step: Calling Phase 1
-
-**Request:**
+### Calling Phase 1
 
 ```bash
 curl -X DELETE \
-  "https://{api_id}.execute-api.ap-south-1.amazonaws.com/prod/account" \
-  -H "Authorization: Bearer eyJraWQiOiJleGFtcGxlIiwidHlwIjoiSldUIn0..."
+  "https://{api_id}.execute-api.ap-south-1.amazonaws.com/{stage}/account" \
+  -H "Authorization: Bearer <AccessToken>"
 ```
 
-**Success response (200):**
+**On 200:** Save `deletionToken`. Clear all local tokens, cache, and session state. Redirect to post-deletion screen.
 
-```json
-{
-    "message": "Your account deletion request has been received. Your access has been revoked immediately. All associated data will be permanently removed within 7 business days.",
-    "status": "processing"
-}
-```
+**On 401:** Token expired - re-authenticate and retry once.
 
-**What your app must do after a 200 response:**
+**On 500:** Show a generic error. Retry is safe (Phase 1 is idempotent).
 
-```
-1. Clear all stored tokens (AccessToken, RefreshToken, IdToken)
-2. Clear any locally cached user data
-3. Invalidate any in-memory session state
-4. Redirect the user to a post-deletion screen
-5. Do NOT call any other Digilux API with this user's credentials
-```
+> After a successful 200 from Phase 1, do not attempt to refresh the token or call any other Digilux API with this user's credentials. The Cognito account is disabled.
 
-**Idempotency:** If your app calls `DELETE /account` again (e.g., due to a network retry), and Phase 1 has already completed, you will receive:
+### Restore (within 7 days)
 
-```json
-{
-    "message": "Your account deletion request has been received. ...",
-    "status": "already_processed"
-}
-```
-
-This is a 200 and is safe. Treat it identically to `status: processing`.
-
----
-
-### 5.3 Step-by-step: Admin Force-Archive (Phase 2)
-
-This is only needed if your admin tooling needs to immediately archive a user rather than waiting for the next daily sweep. Most consuming teams will never need to call this directly.
-
-**Prerequisite check:** Before calling, confirm the user is INACTIVE:
-
-```bash
-# Check user_data table (requires DynamoDB access)
-aws dynamodb get-item \
-  --table-name digilux_honeywell_user_data \
-  --key '{"userId": {"S": "cognito-sub-uuid-abc-123"}}'
-```
-
-Confirm the response shows `"status": {"S": "INACTIVE"}` and `"archivePending": {"BOOL": true}`.
-
-**Request:**
+Present the user with a restore option while within the 7-day window. They need their `deletionToken` (returned in the Phase 1 response - display it in the app or send it by email).
 
 ```bash
 curl -X POST \
-  "https://{api_id}.execute-api.ap-south-1.amazonaws.com/prod/admin/archive" \
-  -H "Authorization: Bearer <admin_token>" \
+  "https://{api_id}.execute-api.ap-south-1.amazonaws.com/{stage}/account/restore" \
   -H "Content-Type: application/json" \
-  -d '{"userId": "cognito-sub-uuid-abc-123"}'
+  -d '{"token": "f47ac10b-58cc-4372-a567-0e02b2c3d479"}'
 ```
 
-**Success response (200):**
+On 200, the user can log in again immediately.
 
-```json
-{
-    "message": "Archive complete for userId=cognito-sub-uuid-abc-123"
-}
-```
+### Retry policy
 
-**On 500 with verification failure:**
-
-```json
-{
-    "error": "Archive verification failed — hard-delete aborted. Archive file missing: archive/cognito-sub-uuid-abc-123/dynamodb/device_data.json"
-}
-```
-
-Action: Check `s3://digilux-honeywell-archive/archive/{userId}/dynamodb/` for partial writes. Investigate S3 bucket permissions and retry.
-
----
-
-### 5.4 Retry policy
-
-| Scenario | Safe to retry? | Recommended action |
+| Scenario | Retry? | Action |
 |---|---|---|
-| Phase 1 → 401 | Yes | Re-authenticate and retry once |
-| Phase 1 → 500 (`"Failed to process deletion request"`) | Yes | Retry up to 3 times with exponential back-off |
-| Phase 1 → 200 (any status) | No retry needed | Done |
-| Phase 2 → 400 (userId not found or not eligible) | No | Fix the precondition first |
-| Phase 2 → 500 (verification failed) | Yes | Investigate S3, retry after fix |
-| Phase 2 → 500 (unexpected error) | Yes | Retry once; if it persists, escalate to platform team |
+| Phase 1 -> 401 | Yes | Re-authenticate and retry once |
+| Phase 1 -> 500 | Yes | Retry up to 3x, exponential back-off |
+| Phase 1 -> 200 | No | Done |
+| Restore -> 400 (window expired) | No | Data already deleted, cannot restore |
+| Admin Phase 2 -> 400 (window open) | No | Wait for 7-day window to close |
+| Admin Phase 2 -> 500 (verification failed) | Yes | Check S3, then retry |
 
----
-
-### 5.5 What NOT to do
+### What NOT to do
 
 | Do NOT | Why |
 |---|---|
-| Call `DELETE /account` without user confirmation | Irreversible. Cannot be undone. |
-| Attempt to refresh the token after Phase 1 succeeds | The Cognito user is deleted. The refresh token is invalid. |
-| Call any other Digilux API with the deleted user's credentials | They will fail with 401 from Cognito. |
-| Call Phase 2 before Phase 1 | The user is not INACTIVE yet — Phase 2 will return 400. |
-| Hard-code the `userId` | Always extract it from the `sub` claim of the JWT — never from a username or email. |
-| Ignore a 500 on Phase 1 | The user may still be active. Show an error and allow them to retry. |
-| Poll Phase 2 to check if data is deleted | Data removal is async. It happens within 24 hours automatically. There is no "done" webhook. |
+| Call DELETE /account without user confirmation | Irreversible after 7 days |
+| Attempt token refresh after Phase 1 | Cognito is disabled. Refresh fails. |
+| Call the admin archive endpoint within 7 days | Grace period enforced - returns 400 |
+| Hard-code userId | Always extract from the `sub` JWT claim |
+| Ignore a 500 on Phase 1 | User may still be active. Show error and let them retry. |
 
 ---
 
 ## 6. Audit Trail
 
-Every deletion is fully auditable. A record is written to `digilux_honeywell_deletion_audit` and structured log lines are emitted to CloudWatch.
+### 6.1 deletion_audit table
 
-### 6.1 DynamoDB audit record schema
+Tracks the full deletion pipeline. One record per user.
 
-**Key schema:** `userId` (PK, String) + `requestedAt` (SK, String ISO-8601 timestamp)
+**Key schema:** `userId` (PK, String) + `requestedAt` (SK, ISO-8601 timestamp)
 
-**After Phase 1 completes:**
+**After Phase 1:**
 
 ```json
 {
-    "userId":               "cognito-sub-uuid-abc-123",
-    "requestedAt":          "2025-08-16T02:14:37.123456+00:00",
-    "status":               "PHASE1_COMPLETE",
-    "phase1CompletedAt":    "2025-08-16T02:14:37.123456+00:00",
-    "globalSignOutStatus":  "ok",
-    "devicesFound":         3,
-    "devicesReleased":      3,
+    "userId": "cognito-sub-uuid-abc-123",
+    "requestedAt": "2026-08-16T02:14:37+00:00",
+    "status": "PHASE1_COMPLETE",
+    "phase1CompletedAt": "2026-08-16T02:14:37+00:00",
+    "globalSignOutStatus": "ok",
+    "cognitoDisableStatus": "ok",
+    "devicesFound": 3,
+    "devicesReleased": 3,
     "devicesReleaseFailed": 0,
-    "cognitoDeleteStatus":  "ok",
-    "deletedBy":            "cognito-sub-uuid-abc-123"
+    "deletedBy": "cognito-sub-uuid-abc-123"
 }
 ```
 
-**After Phase 2 completes (fields added):**
+**After Phase 2 (additional fields added):**
 
 ```json
 {
-    "userId":               "cognito-sub-uuid-abc-123",
-    "requestedAt":          "2025-08-16T02:14:37.123456+00:00",
-    "status":               "PHASE2_COMPLETE",
-    "phase1CompletedAt":    "2025-08-16T02:14:37.123456+00:00",
-    "globalSignOutStatus":  "ok",
-    "devicesFound":         3,
-    "devicesReleased":      3,
-    "devicesReleaseFailed": 0,
-    "cognitoDeleteStatus":  "ok",
-    "deletedBy":            "cognito-sub-uuid-abc-123",
-    "resolveCompletedAt":   "2025-08-17T02:00:04.221000+00:00",
-    "archiveCompletedAt":   "2025-08-17T02:00:07.832000+00:00",
-    "verifyCompletedAt":    "2025-08-17T02:00:08.105000+00:00",
-    "hardDeleteCompletedAt":"2025-08-17T02:00:09.441000+00:00",
-    "phase2CompletedAt":    "2025-08-17T02:00:09.442000+00:00",
+    "status": "PHASE2_COMPLETE",
+    "resolveCompletedAt": "2026-08-23T02:00:04+00:00",
+    "archiveCompletedAt": "2026-08-23T02:00:07+00:00",
+    "verifyCompletedAt": "2026-08-23T02:00:08+00:00",
+    "hardDeleteCompletedAt": "2026-08-23T02:00:09+00:00",
+    "phase2CompletedAt": "2026-08-23T02:00:09+00:00",
+    "cognitoDeleteStatus": "ok",
+    "subdevicesDeleted": 8,
     "tablesDeleted": {
-        "automation_event":              2,
-        "automation_schedule_direct":    1,
-        "automation_schedule_ctrl":      1,
-        "device_state":                  3,
-        "entity_state":                  6,
-        "scene_data":                    4,
-        "device_data":                   3,
-        "user_device_details":           1,
-        "user_device_mapping":           1,
-        "user_subuser_detail":           0,
-        "user_subuser_mapping":          0,
-        "subuser_role_data":             1,
-        "admin_otp_data":                2,
-        "alexa_lwa_tokens":              1
+        "scene_data": 4,
+        "user_device_details": 1,
+        "automation_schedule_controller": 7,
+        "automation_schedule_direct": 3
     },
-    "s3ObjectsDeleted":     12,
-    "errors":               []
+    "s3ObjectsDeleted": 12,
+    "errors": []
 }
 ```
 
-**Possible `status` values:**
-
-| Value | Meaning |
+| `status` | Meaning |
 |---|---|
-| `PHASE1_COMPLETE` | Phase 1 done; Phase 2 not yet run |
-| `PHASE2_COMPLETE` | Full pipeline complete; all data removed |
-| `PHASE2_PARTIAL` | Phase 2 ran but some individual row deletes failed (errors list will be non-empty) |
-
-**`globalSignOutStatus` values:**
-
-| Value | Meaning |
-|---|---|
-| `ok` | Sign-out succeeded |
-| `user_not_found` | Cognito user was not found — may already be deleted |
-| `error` | Sign-out threw an unexpected exception |
-| `not_attempted` | Step was skipped (should not occur in normal flow) |
-
-**`cognitoDeleteStatus` values:**
-
-| Value | Meaning |
-|---|---|
-| `ok` | Cognito user deleted |
-| `already_absent` | Cognito user did not exist (sign-out may have deleted them, or they were never in Cognito) |
-| `error` | Delete threw an unexpected exception |
+| `PHASE1_COMPLETE` | Phase 1 done, Phase 2 pending |
+| `PHASE2_COMPLETE` | All data permanently deleted |
+| `PHASE2_PARTIAL` | Phase 2 ran but some row deletes failed - check `errors[]` |
+| `RESTORED` | User restored within the 7-day window |
 
 ---
 
-### 6.2 CloudWatch audit events
+### 6.2 deletion_evidence table
 
-Every significant action emits a structured JSON log line. Use CloudWatch Logs Insights to query them.
+Compliance-grade record. Proves who initiated deletion, when, and from where. Email is stored KMS-encrypted (PII protection).
 
-**Log group:** The Lambda function's log group (e.g., `/aws/lambda/phase1_account_deletion` and `/aws/lambda/phase2_archive_worker`).
+**Key schema:** `deletionToken` (PK, UUID)
 
-**Event types emitted:**
+```json
+{
+    "deletionToken": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+    "userId": "cognito-sub-uuid-abc-123",
+    "emailEncrypted": "AQICAHh...base64-kms-ciphertext...==",
+    "requestedAt": "2026-08-16T02:14:37+00:00",
+    "ipAddress": "203.0.113.42",
+    "userAgent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 ...)",
+    "archiveStartedAt": null,
+    "archiveCompletedAt": null,
+    "archiveDeletedAt": null,
+    "restoredAt": null
+}
+```
+
+| Field | Description |
+|---|---|
+| `deletionToken` | UUID returned to user at Phase 1. Acts as proof-of-request and restore key. |
+| `emailEncrypted` | User email encrypted with AWS KMS. Decryptable only by authorised roles. |
+| `ipAddress` | Source IP captured from API Gateway request context. |
+| `userAgent` | Browser/device string from request headers. |
+| `archiveDeletedAt` | Set when Phase 2 completes - confirms when data was permanently destroyed. |
+| `restoredAt` | Set if user restored. Null if deletion went through. |
+
+---
+
+### 6.3 CloudWatch audit events
+
+Every step emits a structured JSON line to CloudWatch. Queryable via Logs Insights.
+
+**Log groups:** `/aws/lambda/{env}-delete-account-phase1` and `/aws/lambda/{env}-delete-account-phase2`
 
 | `audit_event` | Phase | Key fields |
 |---|---|---|
-| `DELETION_REQUEST_RECEIVED` | 1 | `userId`, `trigger: "self"` |
+| `DELETION_REQUEST_RECEIVED` | 1 | `userId`, `trigger` |
 | `DELETION_ALREADY_PROCESSED` | 1 | `userId` |
 | `GLOBAL_SIGN_OUT` | 1 | `userId`, `status` |
 | `USER_MARKED_INACTIVE` | 1 | `userId`, `archivePending`, `markedAt` |
 | `MARK_INACTIVE_FAILED` | 1 | `userId` |
 | `DEVICES_RELEASED` | 1 | `userId`, `devicesFound`, `devicesReleased`, `devicesReleaseFailed` |
-| `DEVICES_RELEASE_FAILED` | 1 | `userId`, `reason` |
-| `COGNITO_USER_DELETED` | 1 | `userId`, `status` |
+| `COGNITO_USER_DISABLED` | 1 | `userId`, `status` |
+| `DELETION_EVIDENCE_WRITTEN` | 1 | `userId`, `deletionToken` |
 | `PHASE1_COMPLETE` | 1 | `userId` + all step outcomes |
 | `PHASE2_STARTED` | 2 | `userId` |
-| `RESOLVE_COMPLETE` | 2 | `userId`, `devices`, `scenes`, `automationEvents`, `s3Objects` |
-| `ARCHIVE_COMPLETE` | 2 | `userId`, `dynamodbCollections: 14`, `s3ObjectsCopied` |
-| `VERIFY_COMPLETE` | 2 | `userId`, `filesVerified: 14` |
-| `HARD_DELETE_COMPLETE` | 2 | `userId`, `tablesDeleted`, `s3ObjectsDeleted` |
-| `HARD_DELETE_PARTIAL` | 2 | `userId`, `errors[]`, `tablesDeleted` |
+| `GRACE_PERIOD_REJECTED` | 2 | `userId`, `requestedAt`, `earliestRunAt` |
+| `RESOLVE_COMPLETE` | 2 | `userId`, `devices`, `scenes`, `s3Objects` |
+| `SUBDEVICE_SCAN_COMPLETE` | 2 | `userId`, `endpointFilesRead`, `subdeviceMacsFound`, `rowsToDelete` |
+| `ARCHIVE_COMPLETE` | 2 | `userId`, `tablesArchived`, `s3ObjectsCopied` |
+| `VERIFY_COMPLETE` | 2 | `userId`, `filesVerified` |
+| `HARD_DELETE_COMPLETE` | 2 | `userId`, `tablesDeleted`, `subdevicesDeleted`, `s3ObjectsDeleted` |
+| `HARD_DELETE_PARTIAL` | 2 | `userId`, `errors[]` |
+| `COGNITO_USER_DELETED` | 2 | `userId`, `status` |
 | `PHASE2_COMPLETE` | 2 | `userId` |
+| `ACCOUNT_RESTORED` | Restore | `userId`, `deletionToken`, `restoredAt` |
 
-**Example log line (raw):**
-
-```json
-{
-    "audit_event": "PHASE1_COMPLETE",
-    "userId": "cognito-sub-uuid-abc-123",
-    "timestamp": "2025-08-16T02:14:37.123456+00:00",
-    "globalSignOutStatus": "ok",
-    "devicesFound": 3,
-    "devicesReleased": 3,
-    "devicesReleaseFailed": 0,
-    "cognitoDeleteStatus": "ok"
-}
-```
-
----
-
-## 7. Monitoring & Alerting
-
-### Recommended CloudWatch Logs Insights queries
-
-**Trace the full deletion lifecycle for one user:**
+**Example - trace full lifecycle for one user:**
 
 ```
-fields @timestamp, audit_event, status, devicesFound, devicesReleased, tablesDeleted, errors
+fields @timestamp, audit_event, status, errors
 | filter userId = "cognito-sub-uuid-abc-123"
 | sort @timestamp asc
 ```
 
-**All Phase 1 completions in the last 24 hours:**
-
-```
-filter audit_event = "PHASE1_COMPLETE"
-| stats count() as total by bin(1h)
-```
-
-**All verification failures (data was NOT deleted — needs attention):**
+**Example - find verification failures (needs immediate attention):**
 
 ```
 filter audit_event = "HARD_DELETE_PARTIAL" or message like "verification failed"
@@ -909,30 +639,40 @@ filter audit_event = "HARD_DELETE_PARTIAL" or message like "verification failed"
 | sort @timestamp desc
 ```
 
-**Devices that failed to release during Phase 1:**
+---
 
-```
-filter audit_event = "DEVICES_RELEASED" and devicesReleaseFailed > 0
-| fields @timestamp, userId, devicesFound, devicesReleased, devicesReleaseFailed
-```
+## 7. Monitoring & Alerting
 
-**Phase 2 sweep summary (how many users processed per sweep):**
+### Recommended alarms
 
-```
-filter message like "Sweep complete"
-| fields @timestamp, message
-| sort @timestamp desc
-```
-
-### Recommended CloudWatch Alarms
-
-| Alarm | Metric / Pattern | Threshold | Action |
+| Alarm | Pattern | Threshold | Action |
 |---|---|---|---|
-| Verification failures | `filter message like "verification failed"` | Count > 0 in 5 min | Page on-call |
-| Phase 1 DynamoDB failure | `filter audit_event = "MARK_INACTIVE_FAILED"` | Count > 0 in 5 min | Alert platform team |
-| Phase 2 sweep zero-processed | `filter message like "Sweep complete" and processed = 0` | Check if pending users exist | Investigate EventBridge |
-| High device release failures | `filter audit_event = "DEVICES_RELEASED" and devicesReleaseFailed > 0` | Count > 5 in 1 hour | Alert device team |
-| Lambda errors | `Lambda Errors` metric | Count > 2 in 5 min | Alert platform team |
+| Verification failure | `audit_event = "HARD_DELETE_PARTIAL"` | Count > 0 | Page on-call immediately |
+| Phase 1 fatal failure | `audit_event = "MARK_INACTIVE_FAILED"` | Count > 0 | Alert platform team |
+| Lambda errors (Phase 1) | Lambda `Errors` metric | > 2 in 5 min | Alert platform team |
+| Lambda errors (Phase 2) | Lambda `Errors` metric | > 0 in sweep window | Alert platform team |
+| High device release failures | `devicesReleaseFailed > 0` | Count > 5 in 1 hr | Alert device team |
+
+### Useful queries
+
+```sql
+-- Deletions by hour (last 24 h)
+filter audit_event = "PHASE1_COMPLETE"
+| stats count() as total by bin(1h)
+
+-- All restores in last 7 days
+filter audit_event = "ACCOUNT_RESTORED"
+| fields @timestamp, userId, deletionToken
+
+-- Phase 2 results (complete vs partial)
+filter audit_event = "PHASE2_COMPLETE" or audit_event = "HARD_DELETE_PARTIAL"
+| fields @timestamp, audit_event, userId, errors
+| sort @timestamp desc
+
+-- Users blocked by grace period (admin called too early)
+filter audit_event = "GRACE_PERIOD_REJECTED"
+| fields @timestamp, userId, requestedAt, earliestRunAt
+```
 
 ---
 
@@ -940,126 +680,53 @@ filter message like "Sweep complete"
 
 ### Phase 1 issues
 
----
-
-**Problem:** User receives 401 even with a valid-looking token.
-
-**Cause:** Token may have expired (Cognito AccessTokens expire after 1 hour) or the API Gateway Cognito Authorizer is rejecting it.
-
-**Fix:**
-1. Decode the token at [jwt.io](https://jwt.io) and check the `exp` claim.
-2. Re-authenticate to get a fresh token.
-3. If the issue persists, check API Gateway Authorizer logs.
-
----
-
-**Problem:** User receives 500 "Failed to process deletion request."
-
-**Cause:** DynamoDB `update_item` failed when trying to set `status=INACTIVE`. Possible causes: DynamoDB throttling, table does not exist, Lambda IAM role missing `dynamodb:UpdateItem` permission.
-
-**Fix:**
-1. Check CloudWatch logs for the `[{userId}] Failed to mark INACTIVE` error line.
-2. Verify the Lambda execution role has `dynamodb:UpdateItem` on `digilux_honeywell_user_data`.
-3. Check DynamoDB CloudWatch metrics for throttling.
-4. Retry — Phase 1 is idempotent.
-
----
-
-**Problem:** User says they can still log in after deletion.
-
-**Cause:** Phase 3 global sign-out or Cognito delete failed silently. Check the audit record.
-
-**Fix:**
-1. Query `deletion_audit` for this user. Check `globalSignOutStatus` and `cognitoDeleteStatus`.
-2. If either is `error`, manually call `admin_user_global_sign_out` and `admin_delete_user` via the AWS CLI:
-
-```bash
-aws cognito-idp admin-user-global-sign-out \
-  --user-pool-id ap-south-1_KJpJMEzyM \
-  --username cognito-sub-uuid-abc-123
-
-aws cognito-idp admin-delete-user \
-  --user-pool-id ap-south-1_KJpJMEzyM \
-  --username cognito-sub-uuid-abc-123
-```
-
----
+| Symptom | Cause | Fix |
+|---|---|---|
+| User gets 401 with valid-looking token | Token expired (1-hour TTL) | Re-authenticate and retry |
+| User gets 500 on every retry | DynamoDB UpdateItem on user_data failing | Check Lambda CloudWatch logs; verify IAM allows `dynamodb:UpdateItem` on user_data |
+| User can still log in after 200 response | `admin_disable_user` step failed (non-fatal) | Check `COGNITO_USER_DISABLED` log event; manually disable in Cognito if needed |
+| `deletionToken` missing from response | Phase 1 Lambda not yet updated | Redeploy Phase 1 Lambda |
 
 ### Phase 2 issues
 
----
+| Symptom | Cause | Fix |
+|---|---|---|
+| Phase 2 rejected with grace period error | Admin called within 7 days of Phase 1 | Wait for the window to close |
+| `Archive verification failed` in logs | S3 write succeeded but HeadObject failed | Check S3 bucket permissions + `s3:HeadObject` IAM permission; retry |
+| `PHASE2_PARTIAL` status | Some `DeleteItem` calls failed | Check `errors[]` in audit record; reset `archivePending=true` and retry Phase 2 |
+| Subdevice rows not deleted | S3 endpoint files not found under userId/ | Verify files exist in metadata bucket; check `s3:ListBucket` IAM permission |
+| EventBridge sweep not running | Schedule disabled or Lambda permission missing | Check `aws scheduler get-schedule`; check Lambda resource-based policy |
 
-**Problem:** `PHASE2_PARTIAL` in audit log — `errors` list is non-empty.
+### Restore issues
 
-**Cause:** One or more individual `delete_item` calls failed (throttling, permission issue, item already deleted).
+| Symptom | Cause | Fix |
+|---|---|---|
+| Restore returns 400 "window expired" | >7 days since Phase 1 | Cannot restore - data was deleted |
+| Restore returns 400 "invalid token" | Wrong token value | Check `deletion_evidence` table for the userId |
+| User restored but cannot log in | `admin_enable_user` failed | Manually enable user in Cognito console |
 
-**Fix:**
-1. Check `tablesDeleted` in the audit record — the count shows which tables had failures.
-2. Rows that failed to delete remain in the source table. Re-run Phase 2 (call the force-archive endpoint again).
-3. The guard check (`archivePending=true`) is cleared after Phase 2 runs — you may need to reset it manually before re-running:
-
-```bash
-aws dynamodb update-item \
-  --table-name digilux_honeywell_user_data \
-  --key '{"userId": {"S": "cognito-sub-uuid-abc-123"}}' \
-  --update-expression "SET archivePending = :t" \
-  --expression-attribute-values '{":t": {"BOOL": true}}'
-```
-
----
-
-**Problem:** Phase 2 returns `500 verification failed — hard-delete aborted`.
-
-**Cause:** Archive write appeared to succeed but `head_object` could not confirm the file (eventual consistency, S3 permissions, or write failure).
-
-**Fix:**
-1. Check `s3://digilux-honeywell-archive/archive/{userId}/dynamodb/` for the named missing file.
-2. Verify the Lambda execution role has `s3:HeadObject` on `digilux-honeywell-archive`.
-3. If the file is there but reported missing, wait 10–30 seconds (S3 eventual consistency) and retry.
-4. Source data is **not touched** — it is safe to retry.
-
----
-
-**Problem:** Phase 2 sweep ran but a user with `status=INACTIVE` and `archivePending=true` was not processed.
-
-**Cause:** DynamoDB scan may have missed the user due to an item that fails the FilterExpression (e.g., `archivePending` stored as a string `"true"` instead of a boolean `true`).
-
-**Fix:**
-1. Inspect the user's record:
+### Full deletion verification checklist
 
 ```bash
+# 1. Audit record shows PHASE2_COMPLETE
+aws dynamodb query \
+  --table-name digilux_honeywell_deletion_audit \
+  --key-condition-expression "userId = :u" \
+  --expression-attribute-values '{":u": {"S": "USER_ID"}}'
+
+# 2. user_data shows INACTIVE + archivePending false
 aws dynamodb get-item \
   --table-name digilux_honeywell_user_data \
-  --key '{"userId": {"S": "cognito-sub-uuid-abc-123"}}'
-```
+  --key '{"userId": {"S": "USER_ID"}}'
 
-2. Confirm `archivePending` is `{"BOOL": true}` (not `{"S": "true"}`).
-3. Use the force-archive endpoint to immediately process this user.
+# 3. Archive files exist in S3
+aws s3 ls s3://digilux-honeywell-archive/archive/USER_ID/dynamodb/ --recursive
 
----
-
-**Problem:** The same `automation_event` row is archived twice.
-
-**Cause:** This was a known edge case where a row is reachable via both `sceneId` and `duid` GSIs. The archiver deduplicates by `automationId` internally.
-
-**Resolution:** Already handled — deduplication is built into `_resolve_automations`. If you see duplicates in the archive file, it is a pre-existing data issue in the source table, not an archiver bug.
-
----
-
-### Checklist: confirming a clean full deletion
-
-To verify that a user's deletion is fully complete:
-
-```
-[ ] deletion_audit record has status = PHASE2_COMPLETE
-[ ] deletion_audit.errors is an empty list []
-[ ] deletion_audit.tablesDeleted counts match expected row counts
-[ ] user_data.status = INACTIVE and user_data.archivePending = false
-[ ] user_data.archivedAt is set
-[ ] s3://digilux-honeywell-archive/archive/{userId}/dynamodb/ contains all 14 JSON files
-[ ] Cognito: admin-get-user returns UserNotFoundException
-[ ] device_data: no rows with this userId (userId = "0" from Phase 1 release)
-[ ] CloudWatch: PHASE2_COMPLETE event visible in logs
+# 4. Cognito user is gone
+aws cognito-idp admin-get-user \
+  --user-pool-id ap-south-1_KJpJMEzyM \
+  --username USER_ID
+# Expected: UserNotFoundException
 ```
 
 ---
@@ -1071,8 +738,6 @@ This section is for the **DevOps / Infrastructure team** responsible for deployi
 ---
 
 ### 9.1 Prerequisites
-
-Install and configure the following tools before you start.
 
 | Tool | Minimum version | Install |
 |---|---|---|
@@ -1089,20 +754,13 @@ aws configure --profile digilux
 # AWS Secret Access Key: <your secret>
 # Default region:        ap-south-1
 # Default output format: json
-```
 
-Set the profile for the session:
-```bash
 export AWS_PROFILE=digilux
 ```
 
-For Honeywell client deployment, configure a separate profile:
-```bash
-aws configure --profile honeywell
-export AWS_PROFILE=honeywell
-```
+For Honeywell client: `aws configure --profile honeywell` and `export AWS_PROFILE=honeywell`.
 
-**Minimum IAM permissions required for the deploying user/role:**
+**Minimum IAM permissions for the deploying user/role:**
 
 ```json
 {
@@ -1122,72 +780,57 @@ export AWS_PROFILE=honeywell
 }
 ```
 
-> In practice, scope this to specific resources. The above is the broadest safe policy for initial deployment.
-
 ---
 
 ### 9.2 Repository structure
 
 ```
 digilux-delete-account/
-│
-├── Makefile                          ← All deployment commands live here
-│
-├── phase1/
-│   └── lambda_function.py            ← Phase 1 Lambda source
-│
-├── phase2/
-│   ├── lambda_function.py            ← Phase 2 Lambda handler
-│   └── archiver.py                   ← Phase 2 archive/delete engine
-│
-├── infra/
-│   ├── main.tf                       ← Provider + S3 backend
-│   ├── variables.tf                  ← All input variables
-│   ├── locals.tf                     ← Naming + tag conventions
-│   ├── dynamodb.tf                   ← deletion_audit DynamoDB table
-│   ├── s3.tf                         ← Archive S3 bucket
-│   ├── iam.tf                        ← IAM roles + policies
-│   ├── lambda.tf                     ← Lambda functions (auto-zips source)
-│   ├── api_gateway.tf                ← REST API + Cognito authorizer + CORS
-│   ├── eventbridge.tf                ← Daily 02:00 UTC sweep schedule
-│   ├── cloudwatch.tf                 ← Log groups + metric alarms
-│   ├── outputs.tf                    ← API URL, Lambda ARNs, etc.
-│   ├── .builds/                      ← Auto-generated zip files (gitignored)
-│   └── envs/
-│       ├── digilux.tfvars            ← Digilux environment variables
-│       ├── digilux-backend.hcl       ← Digilux Terraform state config
-│       ├── honeywell.tfvars          ← Honeywell client variables
-│       └── honeywell-backend.hcl     ← Honeywell Terraform state config
-│
-├── tests/                            ← 107 unit tests (run before deploy)
-├── postman/                          ← Postman collection for API testing
-└── docs/
-    └── ACCOUNT_DELETION.md           ← This document
++-- Makefile                          <- All deployment commands
++-- phase1/lambda_function.py         <- Phase 1 Lambda
++-- phase2/
+|   +-- lambda_function.py            <- Phase 2 handler
+|   +-- archiver.py                   <- Archive/delete engine
++-- infra/
+|   +-- main.tf                       <- Provider + S3 backend
+|   +-- variables.tf                  <- Input variables
+|   +-- locals.tf                     <- Naming conventions
+|   +-- dynamodb.tf                   <- deletion_audit + deletion_evidence tables
+|   +-- s3.tf                         <- Archive S3 bucket
+|   +-- iam.tf                        <- IAM roles + policies
+|   +-- lambda.tf                     <- Lambda functions (auto-zips source)
+|   +-- api_gateway.tf                <- REST API + authorizer + CORS
+|   +-- eventbridge.tf                <- Daily 02:00 UTC sweep
+|   +-- cloudwatch.tf                 <- Log groups + alarms
+|   +-- outputs.tf                    <- API URL, ARNs, etc.
+|   +-- envs/
+|       +-- digilux.tfvars            <- Digilux variables
+|       +-- digilux-backend.hcl       <- Digilux Terraform state config
+|       +-- honeywell.tfvars          <- Honeywell variables
+|       +-- honeywell-backend.hcl     <- Honeywell state config
++-- tests/                            <- Unit tests
++-- postman/                          <- Postman collection
++-- docs/ACCOUNT_DELETION.md          <- This document
 ```
 
 ---
 
 ### 9.3 One-time bootstrap (first deploy only)
 
-Terraform stores its state in S3 and uses DynamoDB for state locking. These resources must exist **before** running any Terraform command. Create them once — they are shared across all environments.
+Terraform state is stored in S3 with DynamoDB locking. Create these once per AWS account before any Terraform run.
 
 ```bash
-# 1. Create the Terraform state S3 bucket
-aws s3 mb s3://digilux-terraform-state \
-    --region ap-south-1
-
-# Enable versioning on the state bucket (protects against accidental state loss)
+# State bucket
+aws s3 mb s3://digilux-terraform-state --region ap-south-1
 aws s3api put-bucket-versioning \
     --bucket digilux-terraform-state \
     --versioning-configuration Status=Enabled
-
-# Block all public access
 aws s3api put-public-access-block \
     --bucket digilux-terraform-state \
     --public-access-block-configuration \
       BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
 
-# 2. Create the state lock DynamoDB table
+# Lock table
 aws dynamodb create-table \
     --table-name terraform-state-lock \
     --attribute-definitions AttributeName=LockID,AttributeType=S \
@@ -1195,8 +838,6 @@ aws dynamodb create-table \
     --billing-mode PAY_PER_REQUEST \
     --region ap-south-1
 ```
-
-> This only needs to be done **once per AWS account**, not per environment.
 
 ---
 
@@ -1209,239 +850,66 @@ cd digilux-delete-account
 
 ---
 
-### 9.5 Deploy to Digilux environment
+### 9.5 Deploy to Digilux
 
-#### Step 1 — Review the variables
-
-Open `infra/envs/digilux.tfvars` and confirm the values are correct:
-
-```hcl
-env                  = "digilux"
-aws_region           = "ap-south-1"
-cognito_user_pool_id = "ap-south-1_KJpJMEzyM"   # ← confirm this is correct
-table_prefix         = "digilux_honeywell"
-bucket_prefix        = "digilux-honeywell"
-lambda_runtime       = "python3.12"
-phase1_timeout       = 29
-phase2_timeout       = 300
-lambda_memory_mb     = 512
-archive_expiry_days  = 2555
-alert_email          = ""                          # ← set your ops email here
-```
-
-#### Step 2 — Run the tests
-
-Always run unit tests before deploying. They catch Lambda regressions before any code reaches AWS.
-
-```bash
-python3 -m unittest discover tests/ -v
-```
-
-Expected output: `Ran 107 tests in X.XXXs  OK`
-
-If any test fails, **do not deploy**. Fix the issue first.
-
-#### Step 3 — Deploy
-
-```bash
-make deploy ENV=digilux
-```
-
-This runs three steps in sequence:
-1. `terraform init` — downloads providers, connects to S3 backend
-2. `terraform plan` — shows exactly what will be created/changed (review carefully)
-3. `terraform apply` — applies the plan
-
-The first-time plan will show **~20 resources to create**. Review the diff and confirm.
-
-#### Step 4 — Collect outputs
-
-```bash
-make output ENV=digilux
-```
-
-Example output:
-```
-api_base_url             = "https://abc123.execute-api.ap-south-1.amazonaws.com/digilux"
-phase1_endpoint          = "https://abc123.execute-api.ap-south-1.amazonaws.com/digilux/account"
-phase2_admin_endpoint    = "https://abc123.execute-api.ap-south-1.amazonaws.com/digilux/admin/archive"
-admin_api_key            = <sensitive>
-archive_bucket           = "digilux-honeywell-archive"
-deletion_audit_table     = "digilux_honeywell_deletion_audit"
-phase1_log_group         = "/aws/lambda/digilux-delete-account-phase1"
-phase2_log_group         = "/aws/lambda/digilux-delete-account-phase2"
-eventbridge_schedule_name = "digilux-delete-account-daily-sweep"
-```
-
-To see the sensitive admin API key:
-```bash
-terraform -chdir=infra output -raw admin_api_key
-```
-
-**Save these values** — share the API endpoints with the integration team and the admin API key with whoever manages the admin tooling.
+1. Review `infra/envs/digilux.tfvars` - confirm `cognito_user_pool_id` and set `alert_email`.
+2. Run tests: `python3 -m unittest discover tests/ -v` - all must pass.
+3. Deploy: `make deploy ENV=digilux`
+4. Collect outputs: `make output ENV=digilux`
+5. Get admin API key: `terraform -chdir=infra output -raw admin_api_key`
 
 ---
 
-### 9.6 Deploy to Honeywell client environment
+### 9.6 Deploy to Honeywell
 
-#### Step 1 — Fill in the Honeywell variables
-
-Open `infra/envs/honeywell.tfvars` and replace the placeholder values:
-
-```hcl
-env                  = "honeywell"
-aws_region           = "ap-south-1"
-cognito_user_pool_id = "REPLACE_WITH_HONEYWELL_USER_POOL_ID"  # ← required
-table_prefix         = "digilux_honeywell"
-bucket_prefix        = "digilux-honeywell"
-alert_email          = "ops@honeywell-client.com"              # ← recommended
-```
-
-**How to find the Honeywell Cognito User Pool ID:**
-
-```bash
-aws cognito-idp list-user-pools --max-results 20 --region ap-south-1
-```
-
-Look for the pool used by the Honeywell app. Copy the `Id` value (format: `ap-south-1_XXXXXXXXX`).
-
-#### Step 2 — Switch AWS profile to Honeywell account (if different account)
-
-```bash
-export AWS_PROFILE=honeywell
-```
-
-If deploying into the **same AWS account** as Digilux (common for initial setup), leave the profile unchanged. The Terraform state key (`delete-account/honeywell/terraform.tfstate`) keeps the states separate.
-
-#### Step 3 — Run tests and deploy
-
-```bash
-python3 -m unittest discover tests/ -v
-make deploy ENV=honeywell
-```
-
-#### Step 4 — Collect outputs
-
-```bash
-make output ENV=honeywell
-```
-
-The Honeywell deployment creates its own set of resources with `honeywell-` prefix — fully isolated from the Digilux deployment.
+1. Find Honeywell Cognito User Pool: `aws cognito-idp list-user-pools --max-results 20`
+2. Set `cognito_user_pool_id` in `infra/envs/honeywell.tfvars`
+3. Switch profile if different AWS account: `export AWS_PROFILE=honeywell`
+4. Deploy: `make deploy ENV=honeywell`
 
 ---
 
 ### 9.7 Adding a future client environment
 
-To deploy for a new client (e.g., `acme`):
-
-**Step 1** — Create the var file:
 ```bash
-cp infra/envs/honeywell.tfvars infra/envs/acme.tfvars
-```
-
-**Step 2** — Edit `infra/envs/acme.tfvars`:
-```hcl
-env                  = "acme"
-cognito_user_pool_id = "ap-south-1_NEWPOOLID"
-alert_email          = "ops@acme.com"
-```
-
-**Step 3** — Create the backend config:
-```bash
+cp infra/envs/honeywell.tfvars      infra/envs/acme.tfvars
 cp infra/envs/honeywell-backend.hcl infra/envs/acme-backend.hcl
-```
-
-Edit `infra/envs/acme-backend.hcl`:
-```hcl
-key = "delete-account/acme/terraform.tfstate"
-```
-
-**Step 4** — Deploy:
-```bash
+# Edit acme.tfvars: set env, cognito_user_pool_id, alert_email
+# Edit acme-backend.hcl: set key = "delete-account/acme/terraform.tfstate"
 make deploy ENV=acme
 ```
 
-No Terraform code changes are needed. All naming is driven by `var.env`.
+No Terraform code changes needed - all naming is driven by `var.env`.
 
 ---
 
 ### 9.8 Updating Lambda code
 
-When the Lambda source code changes (bug fix, new feature):
-
 ```bash
-# 1. Run tests
-python3 -m unittest discover tests/ -v
-
-# 2. Redeploy — Terraform detects the source_code_hash change and re-uploads
-make deploy ENV=digilux
-```
-
-Terraform's `source_code_hash` on each Lambda resource compares the SHA256 of the zip file. If the code has not changed, Lambda is not redeployed. If the code changed, only the Lambda update is applied — no other resources are touched.
-
-To redeploy to Honeywell at the same time:
-```bash
-make deploy ENV=digilux && make deploy ENV=honeywell
+python3 -m unittest discover tests/ -v  # must pass first
+make deploy ENV=digilux                 # Terraform detects hash change and re-uploads Lambda
 ```
 
 ---
 
-### 9.9 Post-deployment verification checklist
-
-Run this after every deployment to confirm the environment is healthy.
-
-#### Infrastructure checks
+### 9.9 Post-deployment verification
 
 ```bash
-# Confirm Lambda functions exist
 aws lambda get-function --function-name digilux-delete-account-phase1
 aws lambda get-function --function-name digilux-delete-account-phase2
-
-# Confirm DynamoDB table exists
 aws dynamodb describe-table --table-name digilux_honeywell_deletion_audit
-
-# Confirm archive S3 bucket exists
+aws dynamodb describe-table --table-name digilux_honeywell_deletion_evidence
 aws s3 ls s3://digilux-honeywell-archive
-
-# Confirm EventBridge schedule exists
 aws scheduler get-schedule --name digilux-delete-account-daily-sweep
 ```
 
-#### API smoke test (using Postman collection)
-
-Import `postman/digilux-account-deletion.postman_collection.json` and `postman/digilux-dev.postman_environment.json` into Postman.
-
-Set environment variables:
-- `api_id` — from `make output` → `api_base_url` (extract the ID before `.execute-api`)
-- `stage` — `digilux` (or `honeywell`)
-- `cognito_client_id` — Cognito App Client ID
-- `test_username` / `test_password` — a real test user in the Cognito pool
-
-Run **Auth → Get Cognito Token** first, then run the following in order:
+Run the Postman collection - negative tests only (do not run happy-path deletion against a real user in production):
 
 ```
-[ ] Auth → Get Cognito Token                      → 200, user_jwt populated
-[ ] Phase 1 → 03 Unauthorized — No Auth Header   → 401
-[ ] Phase 1 → 04 Malformed JWT                   → 401
-[ ] Phase 2 → 02 Bad Request — Missing userId    → 400
-[ ] CORS → OPTIONS /account                      → 200, CORS headers present
-[ ] CORS → OPTIONS /admin/archive                → 200, CORS headers present
-```
-
-> Do **not** run the happy-path deletion test against a real user in production. Use a dedicated test account.
-
-#### CloudWatch check
-
-```bash
-# Confirm log groups exist
-aws logs describe-log-groups \
-    --log-group-name-prefix /aws/lambda/digilux-delete-account
-
-# Confirm no errors in the last 5 minutes (should be empty on fresh deploy)
-aws logs filter-log-events \
-    --log-group-name /aws/lambda/digilux-delete-account-phase1 \
-    --start-time $(date -v-5M +%s000) \
-    --filter-pattern "ERROR"
+Auth -> Get Cognito Token           -> 200
+Phase 1 -> No Auth Header           -> 401
+Phase 2 -> Missing userId           -> 400
+CORS -> OPTIONS /account            -> 200 with CORS headers
 ```
 
 ---
@@ -1450,14 +918,13 @@ aws logs filter-log-events \
 
 | Command | What it does |
 |---|---|
-| `make deploy ENV=digilux` | Full deploy: init → plan → apply → print outputs |
-| `make init ENV=digilux` | Initialise Terraform backend only |
-| `make plan ENV=digilux` | Generate and save a plan to `infra/.builds/digilux.tfplan` |
-| `make apply ENV=digilux` | Apply the previously saved plan |
-| `make output ENV=digilux` | Print all Terraform outputs |
-| `make fmt` | Auto-format all `.tf` files in place |
-| `make validate ENV=digilux` | Validate HCL syntax (no AWS calls) |
-| `make destroy ENV=digilux` | Destroy all resources (see warning below) |
+| `make deploy ENV=digilux` | Full deploy: init -> plan -> apply -> outputs |
+| `make plan ENV=digilux` | Generate plan only |
+| `make apply ENV=digilux` | Apply a saved plan |
+| `make output ENV=digilux` | Print Terraform outputs |
+| `make fmt` | Auto-format all `.tf` files |
+| `make validate ENV=digilux` | Validate HCL syntax |
+| `make destroy ENV=digilux` | Destroy resources (see warning below) |
 
 ---
 
@@ -1467,15 +934,13 @@ aws logs filter-log-events \
 make destroy ENV=digilux
 ```
 
-> **Important:** The `deletion_audit` DynamoDB table and the `archive` S3 bucket both have `prevent_destroy = true` in Terraform. Running `destroy` will remove Lambdas, API Gateway, EventBridge, IAM roles, and CloudWatch resources — **but the audit table and archive bucket will be refused by Terraform**. This is intentional — audit trails and archived data must never be accidentally lost.
-
-To destroy those two resources you must first manually remove the `lifecycle { prevent_destroy = true }` block from `dynamodb.tf` and `s3.tf`, then re-run `make apply` followed by `make destroy`. **This should never be done in production without explicit written approval.**
+> The `deletion_audit` table, `deletion_evidence` table, and `archive` S3 bucket have `prevent_destroy = true`. They will **not** be destroyed. This is intentional - audit trails and archived data must never be accidentally lost. To destroy them, manually remove the `lifecycle` blocks, apply, then destroy. **Never do this in production without explicit written approval.**
 
 ---
 
 ### 9.12 Environment variables injected into Lambda
 
-These are set automatically by Terraform from `locals.tf`. You do not need to configure them manually.
+All set automatically by Terraform. No manual configuration needed.
 
 **Phase 1 Lambda:**
 
@@ -1485,6 +950,7 @@ These are set automatically by Terraform from `locals.tf`. You do not need to co
 | `TABLE_USER_DATA` | `digilux_honeywell_user_data` |
 | `TABLE_DEVICE_DATA` | `digilux_honeywell_device_data` |
 | `TABLE_DELETION_AUDIT` | `digilux_honeywell_deletion_audit` |
+| `TABLE_DELETION_EVIDENCE` | `digilux_honeywell_deletion_evidence` |
 
 **Phase 2 Lambda:**
 
@@ -1506,89 +972,50 @@ These are set automatically by Terraform from `locals.tf`. You do not need to co
 | `TABLE_AUTOMATION_SCHEDULE_DIRECT` | `digilux_honeywell_automation_schedule_direct` |
 | `TABLE_AUTOMATION_SCHEDULE_CTRL` | `digilux_honeywell_automation_schedule_controller` |
 | `TABLE_DELETION_AUDIT` | `digilux_honeywell_deletion_audit` |
+| `TABLE_DELETION_EVIDENCE` | `digilux_honeywell_deletion_evidence` |
 | `ARCHIVE_BUCKET` | `digilux-honeywell-archive` |
 | `METADATA_BUCKET` | `digilux-honeywell-metadata` |
-
-All values change automatically for other environments based on `table_prefix` and `bucket_prefix` in the `.tfvars` file.
 
 ---
 
 ### 9.13 Rollback procedure
 
-#### Roll back Lambda to previous code version
+**Roll back Lambda to a previous commit:**
 
 ```bash
-# List available Lambda versions
-aws lambda list-versions-by-function \
-    --function-name digilux-delete-account-phase1
-
-# Publish a version from current code (Terraform does not publish versions by default)
-# If you need instant rollback capability, enable publish=true in lambda.tf first.
-
-# Quickest rollback: redeploy from the previous Git commit
-git log --oneline -10
 git checkout <previous-commit-hash> -- phase1/ phase2/
 make deploy ENV=digilux
-git checkout HEAD -- phase1/ phase2/   # restore latest
+git checkout HEAD -- phase1/ phase2/
 ```
 
-#### Roll back Terraform state
-
-If a `terraform apply` partially fails and leaves state inconsistent:
+**Fix corrupted Terraform state:**
 
 ```bash
-# 1. Check current state
 terraform -chdir=infra state list
-
-# 2. Remove a specific broken resource from state (does NOT delete the AWS resource)
 terraform -chdir=infra state rm aws_lambda_function.phase1
-
-# 3. Re-import if needed
-terraform -chdir=infra import \
-    -var-file=envs/digilux.tfvars \
-    aws_lambda_function.phase1 \
-    digilux-delete-account-phase1
-
-# 4. Re-run plan to confirm state is clean
-make plan ENV=digilux
+make plan ENV=digilux   # confirm state is clean
 ```
 
 ---
 
 ### 9.14 Common deployment errors
 
----
+**`Error: S3 bucket not found` on `terraform init`**
+State bucket does not exist. Run Section 9.3 bootstrap commands.
 
-**Error:** `Error: S3 bucket not found` during `terraform init`
+**`InvalidParameterValueException: runtime not supported`**
+Update `lambda_runtime` in `.tfvars` to a supported Python version (e.g., `python3.12`).
 
-**Fix:** The state bucket does not exist yet. Run the bootstrap commands in Section 9.3.
+**`AccessDeniedException: not authorized to perform: iam:CreateRole`**
+Attach the IAM policy from Section 9.1 to the deploying user.
 
----
+**`BadRequestException: REST API doesn't contain any methods`**
+Re-run `make plan` then `make apply`. Terraform ordering issue that resolves on the second pass.
 
-**Error:** `Error: error creating Lambda Function: InvalidParameterValueException: The runtime provided is not supported`
-
-**Fix:** Change `lambda_runtime` in your `.tfvars` to a currently supported value (e.g., `python3.12`). Check supported runtimes at https://docs.aws.amazon.com/lambda/latest/dg/lambda-runtimes.html
-
----
-
-**Error:** `Error: AccessDeniedException: User is not authorized to perform: iam:CreateRole`
-
-**Fix:** The deploying IAM user/role is missing IAM permissions. Attach the policy described in Section 9.1.
-
----
-
-**Error:** `Error: Error creating API Gateway Deployment: BadRequestException: The REST API doesn't contain any methods`
-
-**Fix:** This is a Terraform ordering issue. Run `make plan ENV=<env>` followed by `make apply ENV=<env>` again. The `depends_on` blocks in `api_gateway.tf` should prevent this — if it recurs, add a `time_sleep` resource after the method resources.
-
----
-
-**Error:** `Error: ConflictException: Schedule digilux-delete-account-daily-sweep already exists`
-
-**Fix:** The EventBridge schedule already exists from a previous manual deployment. Import it into Terraform state:
+**`ConflictException: Schedule already exists`**
+Import into state:
 ```bash
-terraform -chdir=infra import \
-    -var-file=envs/digilux.tfvars \
+terraform -chdir=infra import -var-file=envs/digilux.tfvars \
     aws_scheduler_schedule.daily_sweep \
     default/digilux-delete-account-daily-sweep
 ```
@@ -1597,13 +1024,13 @@ terraform -chdir=infra import \
 
 ### 9.15 Support escalation
 
-| Issue | Who to contact |
+| Issue | Contact |
 |---|---|
 | Terraform state corruption | Platform team (Mahesh) |
 | Lambda code bug | Platform team (Mahesh) |
 | Cognito User Pool ID | Client account owner / Honeywell team |
 | AWS account credentials | DevOps lead |
-| Postman collection / API questions | See Section 4 of this document |
+| API / integration questions | See Section 4 of this document |
 
 ---
 
